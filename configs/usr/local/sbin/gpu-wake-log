@@ -1,0 +1,57 @@
+#!/bin/bash
+# Logs every time the NVIDIA GPU is woken from runtime sleep (D3cold): the
+# process the resume ran in, the kernel call path that asked for it, and the
+# processes holding the GPU open.
+#   journalctl -t gpu-wake
+# A kprobe on nv_pmops_runtime_resume (fires only on real wakes) with a stack
+# trace, enabled only in a private ftrace instance (instances/gpuwake), so other
+# tracing is not disturbed. ftrace prints symbol names itself, so this works
+# with kernel.kptr_restrict=2.
+T=/sys/kernel/tracing
+I=$T/instances/gpuwake
+EV='gpuwake/nvwake'
+cleanup() {
+    echo 0 > "$I/events/$EV/enable" 2>/dev/null
+    echo '!stacktrace' > "$I/events/$EV/trigger" 2>/dev/null
+    rmdir "$I" 2>/dev/null
+    echo "-:$EV" >> "$T/kprobe_events" 2>/dev/null
+}
+trap cleanup EXIT
+grep -q "^p:$EV " "$T/kprobe_events" 2>/dev/null || echo "p:$EV nvidia:nv_pmops_runtime_resume" >> "$T/kprobe_events"
+mkdir -p "$I"
+echo stacktrace > "$I/events/$EV/trigger"
+echo 1 > "$I/events/$EV/enable"
+
+who="" stack="" n=0
+report() {
+    [ -n "$who" ] || return
+    local holders="" p c
+    for p in $(fuser /dev/nvidia0 /dev/nvidiactl 2>/dev/null | tr ' ' '\n' | sort -u); do
+        c=$(cat "/proc/$p/comm" 2>/dev/null) || continue
+        [ "$c" = nvidia-powerd ] && continue
+        holders+="$c($p) "
+    done
+    logger -t gpu-wake "NVIDIA GPU woke up (resume ran in ${who}); apps holding it open: ${holders:-none}; requested via: ${stack:-?}"
+    who="" stack="" n=0
+}
+while :; do
+    if IFS= read -r -t 2 line; then
+        case "$line" in
+            *nvwake:*)
+                report
+                pid=$(sed -E 's/^ *.+-([0-9]+) +\[.*/\1/' <<< "$line")
+                comm=$(sed -E 's/^ *(.+)-[0-9]+ +\[.*/\1/' <<< "$line")
+                [ "$comm" = "<...>" ] && comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+                exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+                who="$comm (pid $pid${exe:+, $exe})" ;;
+            *"=> "*)
+                f=${line#*=> }; f=${f%%+0x*}; f=${f%% *}
+                case "$f" in kprobe_*|init_module|ftrace_*|arch_ftrace_*|nv_pmops_runtime_resume|pci_pm_runtime_resume|__rpm_callback|rpm_callback|rpm_resume) continue ;; esac
+                [ -n "$who" ] && [ "$n" -lt 12 ] && { stack+="${stack:+ < }$f"; n=$((n + 1)); } ;;
+        esac
+    elif [ $? -gt 128 ]; then
+        report
+    else
+        break
+    fi
+done < <(cat "$I/trace_pipe")   # a real pipe: read -t does not time out on tracefs files

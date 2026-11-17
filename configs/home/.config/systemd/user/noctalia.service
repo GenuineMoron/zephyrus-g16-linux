@@ -1,0 +1,26 @@
+[Unit]
+Description=Noctalia desktop shell (bar, launcher, notifications, lock screen)
+Documentation=https://docs.noctalia.dev/noctalia/compositor-settings/systemd-service/
+# Upstream 5.5 layout: start once Umbriel is ready, and hold graphical-session.target
+# (and with it every XDG autostart app) until Noctalia reports ready, so tray icons
+# always register.
+PartOf=graphical-session.target
+After=umbriel.service
+Before=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/noctalia
+ExecStartPost=%h/.local/bin/noctalia-relock-if-locked
+# If noctalia ever crashes or is killed, bring it straight back. A locked
+# session whose lock screen has died shows the compositor locked fallback; a restarted
+# noctalia takes the lock back over instead.
+Restart=always
+RestartSec=200ms
+# Apps it launches run as their own services (launch_apps_as_systemd_services),
+# and a memory kill of anything left in here must not stop the shell.
+OOMPolicy=continue
+Slice=session.slice
+
+[Install]
+WantedBy=umbriel-session.target

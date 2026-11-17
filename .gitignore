@@ -1,0 +1,20 @@
+# Build output of the hibtrace module
+tools/hibtrace/*.ko
+tools/hibtrace/*.o
+tools/hibtrace/*.mod*
+tools/hibtrace/.*.cmd
+tools/hibtrace/Module.symvers
+tools/hibtrace/modules.order
+# Raw traces and ACPI dumps stay local (big; ACPI MSDM holds the Windows key)
+traces/
+*.dat
+*.dsl
+*.aml
+tools/pmt/Intel-PMT/
+# makepkg downloads and build output in packaging/
+packaging/*/src/
+packaging/*/pkg/
+packaging/*/*.tar.*
+packaging/*/*.pkg.tar.*
+packaging/hid-asus-wake-dkms/hid-asus.c.cachyos-*
+packaging/hid-asus-wake-dkms/hid-ids.h

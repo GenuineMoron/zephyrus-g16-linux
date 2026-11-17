@@ -1,0 +1,11 @@
+# SearXNG private metasearch: http://127.0.0.1:8888 (this machine only).
+# systemd listens here and starts SearXNG on the first connection; after 15 idle
+# minutes the proxy exits and SearXNG stops with it, so it costs nothing unused.
+[Unit]
+Description=SearXNG private search (socket)
+
+[Socket]
+ListenStream=127.0.0.1:8888
+
+[Install]
+WantedBy=sockets.target

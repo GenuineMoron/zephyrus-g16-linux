@@ -1,0 +1,67 @@
+#!/bin/sh
+# Runs just before every suspend-then-hibernate (ExecStartPre=- of
+# systemd-suspend-then-hibernate.service, so a failure never stops the laptop
+# sleeping; the 1 h in /etc/systemd/sleep.conf.d/ then applies).
+#
+# 1. Battery safety net. While BAT1's low-charge alarm (_BTP) is set, systemd
+#    trusts the firmware to wake the laptop when the battery runs low. This
+#    firmware never does: on 2026-11-12 it slept from 80% to 1% without a wake.
+#    With the alarm at 0, systemd wakes on its own timer (first after
+#    SuspendEstimationSec, then from the drain it measured), checks the battery
+#    and hibernates before it runs flat. The kernel restores the alarm on every
+#    resume, so it is cleared here every time. The stored drain rate is removed
+#    so each sleep starts with a check after one hour.
+# 2. Instant-wake window: standby time before hibernating, sized so the worst
+#    recent drain (last 5 battery-only standby segments of 30+ min in
+#    /var/lib/sleep-stats/history.csv, plus 20%, never below 1.5 W) still leaves
+#    15% in reserve. Clamped to 1-12 h.
+# 3. Night rule, on battery only: once the laptop has slept for an hour and the
+#    time is between 01:00 and 07:00, hibernate. Nothing wakes it again, so a
+#    laptop left for days costs nothing. In practice: sleep that starts in the
+#    evening hibernates at 01:00, sleep that starts between 00:00 and 06:00
+#    hibernates after 1 h, and daytime sleep keeps the battery window above.
+#    (SWU_NOW_SECS, seconds since local midnight, overrides the clock for tests.)
+B=/sys/class/power_supply/BAT1
+OUT=/run/systemd/sleep.conf.d/50-battery-window.conf
+HIST=/var/lib/sleep-stats/history.csv
+rm -f "$OUT"
+
+echo 0 > "$B/alarm" 2>/dev/null
+rm -f /var/lib/systemd/sleep/battery_discharge_percentage_rate_per_hour
+
+cap=$(cat "$B/capacity" 2>/dev/null) || exit 0
+case "$cap" in ''|*[!0-9]*) exit 0 ;; esac
+full=$(cat "$B/charge_full" 2>/dev/null)
+volt=$(cat "$B/voltage_min_design" 2>/dev/null)
+
+worst=$(awk -F, '$2 == "suspend" && $3 >= 1800 && $8 == 0 && $9 == 0 && $7 > 0 { w[++n] = $7 }
+    END { m = 0; for (i = (n > 5 ? n - 4 : 1); i <= n; i++) if (w[i] > m) m = w[i]; print m }' "$HIST" 2>/dev/null)
+
+set -- $(awk -v cap="$cap" -v full="${full:-0}" -v volt="${volt:-0}" -v worst="${worst:-0}" 'BEGIN {
+    wh = full * volt / 1e12; if (wh < 20) wh = 70
+    w = worst * 1.2; if (w < 1.5) w = 1.5
+    m = (cap - 15) / 100 * wh / w * 60
+    if (m > 720) m = 720
+    if (m < 60) m = 60
+    printf "%d %.1f\n", m, w }')
+mins=$1 watts=$2
+case "$mins" in ''|*[!0-9]*) exit 0 ;; esac
+
+night=""
+if [ "$(cat /sys/class/power_supply/ACAD/online 2>/dev/null)" = 0 ]; then
+    now=${SWU_NOW_SECS:-$(date +'%H %M %S' | awk '{ print $1 * 3600 + $2 * 60 + $3 }')}
+    nm=$(awk -v s="$now" 'BEGIN {
+        t = (s + 3600) % 86400                      # time of day one hour from now
+        if (t >= 3600 && t < 25200) { print 60; exit }
+        d = (3600 - s) % 86400; if (d < 0) d += 86400
+        print int((d + 59) / 60) }')                # minutes until the next 01:00
+    case "$nm" in ''|*[!0-9]*) nm=99999 ;; esac
+    if [ "$nm" -lt "$mins" ]; then
+        mins=$nm
+        night=" (night rule: hibernate at $(date -d "@$(( $(date +%s) + nm * 60 ))" +%H:%M 2>/dev/null))"
+    fi
+fi
+
+mkdir -p "${OUT%/*}" || exit 0
+printf '[Sleep]\nHibernateDelaySec=%smin\n' "$mins" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+echo "battery ${cap}%, low-charge alarm $(cat "$B/alarm" 2>/dev/null) (0 = systemd checks the battery itself), planning for ${watts} W: instant-wake window ${mins} min${night}"

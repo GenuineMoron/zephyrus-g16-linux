@@ -1,0 +1,48 @@
+--- a/drivers/hid/hid-asus.c
++++ b/drivers/hid/hid-asus.c
+@@ -588,6 +588,27 @@
+ 				  HID_REQ_SET_REPORT);
+ }
+ 
++/*
++ * Send a feature report from the worker, waking the keyboard first. With USB
++ * autosuspend enabled the keyboard is suspended a moment after the last key
++ * press, and a SET_REPORT sent to it then fails with -ESHUTDOWN: the backlight
++ * keeps its old level until the next key press resumes the device. Take a
++ * runtime PM reference for the transfer, as hidraw does when userspace opens
++ * the device. Only for the worker: the PM callbacks must not resume the
++ * device they are resuming. If the wake fails, send anyway as before.
++ */
++static int asus_kbd_set_report_awake(struct hid_device *hdev, const u8 *buf,
++				     size_t buf_size)
++{
++	int pm = hid_hw_power(hdev, PM_HINT_FULLON);
++	int ret = asus_kbd_set_report(hdev, buf, buf_size);
++
++	if (pm >= 0)
++		hid_hw_power(hdev, PM_HINT_NORMAL);
++
++	return ret;
++}
++
+ static int asus_kbd_init(struct hid_device *hdev, u8 report_id)
+ {
+ 	/*
+@@ -685,7 +706,7 @@
+ 	const u8 buf[FEATURE_KBD_REPORT_SIZE] = { FEATURE_KBD_REPORT_ID, 0xd0, 0x4e, !!enabled };
+ 	int ret;
+ 
+-	ret = asus_kbd_set_report(hdev, buf, sizeof(buf));
++	ret = asus_kbd_set_report_awake(hdev, buf, sizeof(buf));
+ 	if (ret < 0)
+ 		hid_err(hdev, "Asus failed to set fn lock: %d\n", ret);
+ }
+@@ -697,7 +718,7 @@
+ 	};
+ 	int ret;
+ 
+-	ret = asus_kbd_set_report(hdev, buf, sizeof(buf));
++	ret = asus_kbd_set_report_awake(hdev, buf, sizeof(buf));
+ 	if (ret < 0)
+ 		hid_err(hdev, "Asus failed to set keyboard backlight: %d\n", ret);
+ }

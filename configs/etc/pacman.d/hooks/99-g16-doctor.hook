@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux-cachyos*
+Target = nvidia*
+Target = hid-asus-wake-dkms
+Target = mkinitcpio
+
+[Action]
+Description = Checking the new kernel has everything this laptop needs...
+When = PostTransaction
+Exec = /usr/local/bin/g16-doctor --after-update

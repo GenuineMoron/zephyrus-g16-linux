@@ -1,0 +1,48 @@
+# ASUS ROG Zephyrus G16 (GU605) internal keyboard, USB 0b05:19b6:
+# media keys by default, F-keys with Fn. Same layout as G-Helper's "Fn-Lock".
+#
+# This keyboard has no hardware Fn-lock: on its own the top row always sends
+# F1-F12 and Fn+key sends the printed function (G-Helper treats every Zephyrus
+# as software Fn-lock for this reason). Swapping the codes here, in the kernel's
+# keymap, works everywhere (login screen, TTY, games) and costs nothing at run time.
+#
+#   key   no Fn                     with Fn
+#   F1    mute                      F1
+#   F2    keyboard light down       F2
+#   F3    keyboard light up         F3
+#   F4    Aura (next effect)        F4
+#   F5    fan mode (next profile)   fan mode   - the kernel acts on Fn+F5 itself
+#   F6    screenshot                screenshot - Fn+F6 sends Win+Shift+S
+#   F7    brightness down           F7
+#   F8    brightness up             F8
+#   F9    display (Win+P menu)      display    - Fn+F9 sends Win+P
+#   F10   touchpad on/off           F10
+#   F11   sleep                     F11
+#   F12   F12                       airplane mode (unchanged, as in G-Helper)
+#
+# Scancodes recorded on a GU605MI with evtest (2026-11-16); Fn+F11 is the
+# hid-asus sleep usage. Apply: sudo systemd-hwdb --usr update && sudo udevadm trigger -s input
+# (--usr: plain "update" writes /etc/udev/hwdb.bin, which then shadows the copy that
+# systemd package updates rebuild, so later hardware entries would never arrive).
+# Undo: delete this file and run the same two commands.
+evdev:input:b0003v0B05p19B6*
+ KEYBOARD_KEY_7003a=mute
+ KEYBOARD_KEY_7003b=kbdillumdown
+ KEYBOARD_KEY_7003c=kbdillumup
+ KEYBOARD_KEY_7003d=prog3
+ KEYBOARD_KEY_7003e=prog4
+ KEYBOARD_KEY_7003f=print
+ KEYBOARD_KEY_70040=brightnessdown
+ KEYBOARD_KEY_70041=brightnessup
+ KEYBOARD_KEY_70042=switchvideomode
+ KEYBOARD_KEY_70043=f21
+ KEYBOARD_KEY_70044=sleep
+ KEYBOARD_KEY_c00e2=f1
+ KEYBOARD_KEY_ff3100c5=f2
+ KEYBOARD_KEY_ff3100c4=f3
+ KEYBOARD_KEY_ff3100b3=f4
+ KEYBOARD_KEY_ff3100ae=reserved
+ KEYBOARD_KEY_ff310010=f7
+ KEYBOARD_KEY_ff310020=f8
+ KEYBOARD_KEY_ff31006b=f10
+ KEYBOARD_KEY_ff31006c=f11

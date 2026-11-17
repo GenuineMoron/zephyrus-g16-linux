@@ -1,0 +1,20 @@
+# SearXNG itself (upstream git checkout in ~/.local/share/searxng), served by granian on
+# 127.0.0.1:8889, which only searxng.service talks to (TCP rather than a unix socket so
+# SearXNG sees a client address; over a socket its bot detection logs errors). Same granian settings as the
+# official container. Stops when the proxy stops (StopWhenUnneeded).
+# Update: cd ~/.local/share/searxng/src && git pull && ../venv/bin/pip install -U -r requirements.txt -r requirements-server.txt
+#         && SEARXNG_SETTINGS_PATH=~/.config/searxng/settings.yml ../venv/bin/python -m searx.version freeze
+[Unit]
+Description=SearXNG private search (app)
+StopWhenUnneeded=yes
+
+[Service]
+Environment=SEARXNG_SETTINGS_PATH=%h/.config/searxng/settings.yml
+ExecStart=%h/.local/share/searxng/venv/bin/granian --interface wsgi --host 127.0.0.1 --port 8889 --workers 1 --blocking-threads 4 --blocking-threads-idle-timeout 5m --no-ws --log-level warning searx.webapp:app
+# Hold back the proxy until SearXNG answers its health check, so the first request
+# after a cold start is never refused.
+ExecStartPost=/bin/sh -c 'for i in $(seq 300); do curl -fsS -o /dev/null http://127.0.0.1:8889/healthz && exit 0; sleep 0.05; done; exit 1'
+Restart=on-failure
+Nice=5
+MemoryHigh=400M
+MemoryMax=600M

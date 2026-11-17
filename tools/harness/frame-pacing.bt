@@ -1,0 +1,107 @@
+// frame-pacing.bt - eDP-1 frame pacing and input-to-flip latency (read-only, kernel tracepoints/fentry).
+//
+// usage:  sudo timeout 30 bpftrace tools/harness/frame-pacing.bt
+//         (Ctrl-C or timeout prints the histograms; per-second flip count is printed live)
+//
+// (pipe_name 65 = ASCII A.) eDP-1 is i915 pipe A = DRM crtc 0 (verified in i915_display_info).
+//  flips/s           drm_vblank_event_delivered on crtc 0 = page-flip completions handed to a
+//                    userspace DRM client (niri). Idle + VRR on-demand = few or zero per second.
+//  interval_us       gap between delivered flip events (monotonic clock; no suspend in the window)
+//  seq_delta         DRM vblank sequence gap between consecutive flips. 1 = every vblank presented.
+//                    >1 while the interval is short = vblanks skipped (missed frame).
+//  update_us         time spent inside the atomic pipe update critical section (start->end, i915)
+//  vblank_evaded     pipe updates that had to wait for a safe window (vblank evasion)
+//  inputs            input events seen (EV_KEY press / EV_REL / EV_ABS); 0 means no input was
+//                    tested, so input_to_flip is empty for that run.
+//  input_to_flip_us  first input event (key press / relative / absolute) -> next flip on crtc 0,
+//                    only counted if the flip arrives within 100 ms. Kernel-side input latency
+//                    of the compositor path, not the app's render time.
+// Accuracy: timestamps are ktime_get_ns() via bpf (~ns); the flip is the point the event is
+// queued to userspace, not the photon. Add ~1 vblank (~4.2 ms at 240 Hz) for scanout.
+
+BEGIN {
+    printf("frame-pacing: eDP-1 = crtc 0 (pipe A). Ctrl-C to stop.\n");
+}
+
+tracepoint:drm:drm_vblank_event_delivered
+/args.crtc == 0/
+{
+    $t = nsecs;
+    @flips_s = count();
+    @total = count();
+    if (@last_t != 0) {
+        $dt = ($t - @last_t) / 1000;
+        @interval_us = lhist($dt, 0, 20000, 500);
+        @seq_delta = lhist(args.seq - @last_seq, 0, 8, 1);
+        @iv_avg = avg($dt);
+        @iv_min = min($dt);
+        @iv_max = max($dt);
+        // a vblank was skipped while flips were back-to-back (<12 ms apart): candidate missed frame
+        if (args.seq - @last_seq > 1 && $dt < 12000) {
+            @skipped_fast = count();
+        }
+    }
+    @last_t = $t;
+    @last_seq = args.seq;
+    if (@pending_in != 0) {
+        if ($t - @pending_in < 100000000) {
+            @input_to_flip_us = lhist(($t - @pending_in) / 1000, 0, 50000, 2500);
+            @input_to_flip_avg = avg(($t - @pending_in) / 1000);
+        }
+        @pending_in = 0;
+    }
+}
+
+tracepoint:i915:intel_pipe_update_start
+/args.pipe_name == 65/
+{
+    @upd_start[tid] = nsecs;
+}
+
+tracepoint:i915:intel_pipe_update_end
+/args.pipe_name == 65 && @upd_start[tid] != 0/
+{
+    @update_us = lhist((nsecs - @upd_start[tid]) / 1000, 0, 100, 2);
+    @update_avg_us = avg((nsecs - @upd_start[tid]) / 1000);
+    delete(@upd_start[tid]);
+}
+
+tracepoint:i915:intel_pipe_update_vblank_evaded
+/args.pipe_name == 65/
+{
+    @vblank_evaded = count();
+}
+
+fentry:vmlinux:input_event
+/(args.type == 1 && args.value == 1) || args.type == 2 || args.type == 3/
+{
+    @inputs = count();
+    if (@pending_in == 0) {
+        @pending_in = nsecs;
+    }
+}
+
+interval:s:1
+{
+    printf("%s flips/s=", strftime("%H:%M:%S", nsecs));
+    print(@flips_s);
+    clear(@flips_s);
+}
+
+END
+{
+    clear(@upd_start);
+    clear(@last_t); clear(@last_seq); clear(@pending_in);
+    printf("\n== totals ==\n");
+    print(@total);
+    print(@inputs);
+    print(@iv_min); print(@iv_avg); print(@iv_max);
+    print(@skipped_fast);
+    print(@interval_us);
+    print(@seq_delta);
+    print(@input_to_flip_avg);
+    print(@input_to_flip_us);
+    print(@update_avg_us);
+    print(@update_us);
+    print(@vblank_evaded);
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Power button opens the power menu (holds logind's power-key lock)
+Documentation=man:systemd-inhibit(1) man:logind.conf(5)
+# While Noctalia runs, logind leaves the power key to the session, and Umbriel's
+# XF86PowerOff binding opens Noctalia's session menu. At the greeter, or if the
+# shell is down, logind's own action applies (HandlePowerKey, default poweroff).
+# Holding the button for ~4 s still forces the machine off in firmware.
+BindsTo=noctalia.service
+After=noctalia.service
+
+[Service]
+ExecStart=/usr/bin/systemd-inhibit --what=handle-power-key --who="Power menu" --why="The power button opens the power menu" --mode=block sleep infinity
+Slice=session.slice
+
+[Install]
+WantedBy=noctalia.service

@@ -1,0 +1,267 @@
+From ad61e4f38f61aa2e04a7d831d193f49dea85dd42 Mon Sep 17 00:00:00 2001
+From: zephyrus-g16-linux <noreply@localhost>
+Date: Sun, 15 Nov 2026 06:08:14 +0000
+Subject: [PATCH] info: detect HDR from DisplayID 2.0 data blocks (backport for
+ 0.3.0)
+
+Some laptop OLED panels (e.g. Samsung ATNA60DL01 in the ASUS ROG
+Zephyrus G16 GU605) declare HDR only in a DisplayID 2.0 extension:
+BT.2020/SMPTE ST 2084 in the Display Interface Features data block
+(0x26) and their luminance range in the Display Parameters data block
+(0x21). There is no CTA-861 extension, so di_info_get_hdr_static_metadata()
+reported no PQ support and compositors (wlroots, Umbriel) never offered HDR.
+
+When no CTA-861 HDR Static Metadata / Colorimetry block exists, fall back
+to the DisplayID 2.0 Display Interface Features combinations (same
+semantics as upstream MR 210) and take the luminance range from the
+Display Parameters block: 10% window peak as desired max, full-screen as
+max frame-average, native minimum as min. BT.2020 YCbCr is only claimed
+when the interface supports a YCbCr encoding.
+
+Same ABI as 0.3.0: only internal structures change.
+
+Upstream: https://gitlab.freedesktop.org/emersion/libdisplay-info/-/merge_requests/210
+---
+ displayid2.c         | 80 ++++++++++++++++++++++++++++++++++++++++++++
+ include/displayid2.h | 15 +++++++++
+ info.c               | 77 ++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 170 insertions(+), 2 deletions(-)
+
+diff --git a/displayid2.c b/displayid2.c
+index 41167fa..2e61087 100644
+--- a/displayid2.c
++++ b/displayid2.c
+@@ -13,6 +13,84 @@
+  */
+ #define DISPLAYID2_MAX_SIZE 256
+ 
++/* IEEE 754 binary16 (used by the Display Parameters data block) to float */
++static float
++half_to_float(uint16_t h)
++{
++	int exp = (h >> 10) & 0x1f;
++	float mant = (float)(h & 0x3ff), v;
++
++	if (exp == 0x1f) {
++		return 0.0f; /* inf/NaN: treat as unset */
++	}
++	if (exp == 0) {
++		v = mant / 1024.0f * (1.0f / 16384.0f); /* subnormal: m * 2^-24 */
++	} else {
++		v = 1.0f + mant / 1024.0f;
++		for (; exp > 15; exp--) {
++			v *= 2.0f;
++		}
++		for (; exp < 15; exp++) {
++			v /= 2.0f;
++		}
++	}
++	return (h & 0x8000) ? -v : v;
++}
++
++static void
++parse_hdr_data_blocks(struct di_displayid2 *displayid2, const uint8_t *data,
++		      size_t section_size)
++{
++	/* Data blocks start after the 4-byte section header; the last byte of
++	 * the section is the checksum. Each block: tag, revision, payload size. */
++	size_t off = 4, end = section_size - 1, len, i;
++	const uint8_t *p;
++
++	while (off + 3 <= end) {
++		len = data[off + 2];
++		if (data[off] == 0 && len == 0) {
++			break; /* padding */
++		}
++		if (off + 3 + len > end) {
++			break;
++		}
++		p = &data[off + 3];
++		switch (data[off]) {
++		case 0x26: /* Display Interface Features */
++			if (len < 9) {
++				break;
++			}
++			displayid2->has_interface_features = true;
++			displayid2->interface_has_ycbcr =
++				get_bit_range(p[1], 5, 0) != 0 ||
++				get_bit_range(p[2], 4, 0) != 0 ||
++				get_bit_range(p[3], 4, 0) != 0;
++			displayid2->interface_std_combos = p[6];
++			displayid2->interface_add_combos_len = 0;
++			for (i = 0; i < get_bit_range(p[8], 2, 0) && 9 + i < len; i++) {
++				displayid2->interface_add_combos[i] = p[9 + i];
++				displayid2->interface_add_combos_len++;
++			}
++			break;
++		case 0x21: /* Display Parameters */
++			if (len < 29) {
++				break;
++			}
++			displayid2->has_display_params = true;
++			displayid2->native_max_luminance_full =
++				half_to_float((uint16_t)(p[21] | (p[22] << 8)));
++			displayid2->native_max_luminance_10pct =
++				half_to_float((uint16_t)(p[23] | (p[24] << 8)));
++			displayid2->native_min_luminance =
++				half_to_float((uint16_t)(p[25] | (p[26] << 8)));
++			break;
++		default:
++			break;
++		}
++		off += 3 + len;
++	}
++}
++
+ static bool
+ validate_checksum(const uint8_t *data, size_t size)
+ {
+@@ -77,6 +155,8 @@ _di_displayid2_parse(struct di_displayid2 *displayid2, const uint8_t *data,
+ 		return false;
+ 	}
+ 
++	parse_hdr_data_blocks(displayid2, data, section_size);
++
+ 	displayid2->logger = NULL;
+ 	return true;
+ }
+diff --git a/include/displayid2.h b/include/displayid2.h
+index e82eae6..f03368f 100644
+--- a/include/displayid2.h
++++ b/include/displayid2.h
+@@ -17,6 +17,21 @@ struct di_displayid2 {
+ 	int revision;
+ 	enum di_displayid2_product_primary_use_case product_primary_use_case;
+ 
++	/* Display Interface Features data block (0x26): colour space/EOTF
++	 * combinations, as in upstream MR 210 (standard bitmap + additional
++	 * combinations, high nibble colour space, low nibble EOTF). */
++	bool has_interface_features;
++	uint8_t interface_std_combos;
++	uint8_t interface_add_combos[7];
++	size_t interface_add_combos_len;
++	bool interface_has_ycbcr;
++
++	/* Display Parameters data block (0x21): native luminance, cd/m² */
++	bool has_display_params;
++	float native_max_luminance_full;
++	float native_max_luminance_10pct;
++	float native_min_luminance;
++
+ 	struct di_logger *logger;
+ };
+ 
+diff --git a/info.c b/info.c
+index f901e06..62d3a51 100644
+--- a/info.c
++++ b/info.c
+@@ -4,6 +4,7 @@
+ #include <string.h>
+ #include <assert.h>
+ 
++#include "bits.h"
+ #include "edid.h"
+ #include "info.h"
+ #include "memory-stream.h"
+@@ -64,6 +65,46 @@ di_edid_get_cta_data_block(const struct di_edid *edid,
+ 	return NULL;
+ }
+ 
++/* Backport of libdisplay-info MR 210 (DisplayID 2.0 Display Interface
++ * Features), plus luminance from the DisplayID 2.0 Display Parameters block. */
++static const struct di_displayid2 *
++edid_get_displayid2_with_features(const struct di_edid *edid)
++{
++	const struct di_edid_ext *const *ext;
++	const struct di_displayid2 *d;
++
++	for (ext = di_edid_get_extensions(edid); *ext; ext++) {
++		d = di_edid_ext_get_displayid2(*ext);
++		if (d != NULL && d->has_interface_features) {
++			return d;
++		}
++	}
++	return NULL;
++}
++
++/* Colour space (high nibble) / EOTF (low nibble) combination supported? */
++static bool
++displayid2_has_combo(const struct di_displayid2 *d, uint8_t space, uint8_t eotf)
++{
++	/* Standard bitmap bits 0-6: sRGB/sRGB, BT.601/BT.601, BT.709/BT.1886,
++	 * AdobeRGB/AdobeRGB, DCI-P3/DCI-P3, BT.2020/BT.2020, BT.2020/ST 2084 */
++	static const uint8_t std[7] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x68 };
++	uint8_t want = (uint8_t)((space << 4) | eotf);
++	size_t i;
++
++	for (i = 0; i < 7; i++) {
++		if (has_bit(d->interface_std_combos, i) && std[i] == want) {
++			return true;
++		}
++	}
++	for (i = 0; i < d->interface_add_combos_len; i++) {
++		if (d->interface_add_combos[i] == want) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static void
+ derive_edid_hdr_static_metadata(const struct di_edid *edid,
+ 				struct di_hdr_static_metadata *hsm)
+@@ -75,8 +116,28 @@ derive_edid_hdr_static_metadata(const struct di_edid *edid,
+ 	hsm->traditional_sdr = true;
+ 
+ 	block = di_edid_get_cta_data_block(edid, DI_CTA_DATA_BLOCK_HDR_STATIC_METADATA);
+-	if (!block)
++	if (!block) {
++		const struct di_displayid2 *d = edid_get_displayid2_with_features(edid);
++
++		if (d == NULL) {
++			return;
++		}
++		hsm->pq = displayid2_has_combo(d, 0x6, 0x8);
++		hsm->hlg = displayid2_has_combo(d, 0x6, 0x9);
++		/* DisplayID has no metadata-type field. A PQ/HLG sink takes the
++		 * CTA-861.3 static metadata (HDR Metadata InfoFrame/SDP), which
++		 * is Static Metadata Type 1, the only type defined. wlroots
++		 * requires type1 before it offers PQ. */
++		hsm->type1 = hsm->pq || hsm->hlg;
++		if ((hsm->pq || hsm->hlg) && d->has_display_params) {
++			/* Peak (10% window) and full-screen luminance map to
++			 * CTA-861's desired max and max frame-average. */
++			hsm->desired_content_max_luminance = d->native_max_luminance_10pct;
++			hsm->desired_content_max_frame_avg_luminance = d->native_max_luminance_full;
++			hsm->desired_content_min_luminance = d->native_min_luminance;
++		}
+ 		return;
++	}
+ 
+ 	cta_hsm = di_cta_data_block_get_hdr_static_metadata(block);
+ 	assert(cta_hsm);
+@@ -156,8 +217,20 @@ derive_edid_supported_signal_colorimetry(const struct di_edid *edid,
+ 	/* Defaults to all unsupported. */
+ 
+ 	block = di_edid_get_cta_data_block(edid, DI_CTA_DATA_BLOCK_COLORIMETRY);
+-	if (!block)
++	if (!block) {
++		const struct di_displayid2 *d = edid_get_displayid2_with_features(edid);
++
++		if (d == NULL) {
++			return;
++		}
++		ssc->bt2020_rgb = displayid2_has_combo(d, 0x6, 0x6) ||
++				  displayid2_has_combo(d, 0x6, 0x8) ||
++				  displayid2_has_combo(d, 0x6, 0x9);
++		/* Only claim YCbCr when the interface supports a YCbCr encoding. */
++		ssc->bt2020_ycc = ssc->bt2020_rgb && d->interface_has_ycbcr;
++		ssc->st2113_rgb = displayid2_has_combo(d, 0x5, 0x5);
+ 		return;
++	}
+ 
+ 	cm = di_cta_data_block_get_colorimetry(block);
+ 	assert(cm);
+-- 
+2.56.0
+

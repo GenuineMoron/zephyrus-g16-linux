@@ -1,0 +1,88 @@
+#!/bin/sh
+# A new real photo on the desktop once a day, like macOS. Keeps a small library of
+# curated photography (Bing's photo of the day + one Windows Spotlight photo per
+# run, both 3840x2160, stored at the panel's 2560x1600), then sets the newest photo not shown yet as the wallpaper
+# (Noctalia recolours the theme from it). Run daily by wallpaper-feed.timer; takes
+# a few seconds and nothing stays running.
+# Credits for every photo: ~/Pictures/Wallpapers/.credits.tsv
+set -u
+DIR=${WALLPAPER_FEED_DIR:-$HOME/Pictures/Wallpapers}
+KEEP=${WALLPAPER_FEED_KEEP:-30}       # newest N photos kept (a month of days), older pruned
+MKT=${WALLPAPER_FEED_MARKET:-en-US}   # Bing/Spotlight market: set yours, e.g. en-GB, de-DE (regional picks)
+SIZE=${WALLPAPER_FEED_SIZE:-2560x1600} # stored at the panel's exact size: faster to decode
+                                      # for Noctalia and the greeter, no rescale per show
+COUNTRY=${MKT#*-}
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+CREDITS=$DIR/.credits.tsv
+mkdir -p "$DIR"; touch "$CREDITS"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+# Skip metered connections (phone hotspot etc.): NM Metered 1 = yes, 3 = guess-yes.
+m=$(busctl get-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+    org.freedesktop.NetworkManager Metered 2>/dev/null | awk '{print $2}')
+case "$m" in 1|3) echo "metered connection: skipping"; exit 0 ;; esac
+
+added=0
+fetch() {   # $1 url  $2 file name  $3 title  $4 credit
+    [ -e "$DIR/$2" ] && return 0
+    curl -fsSL --max-time 120 -A "$UA" -o "$tmp/img" "$1" || { echo "download failed: $2"; return 0; }
+    dims=$(magick identify -format '%w %h' "$tmp/img[0]" 2>/dev/null) || { echo "not an image: $2"; return 0; }
+    set -- "$@" $dims
+    if [ "${5:-0}" -lt 2560 ] || [ "${6:-0}" -lt 1440 ]; then echo "too small (${5}x${6}): $2"; return 0; fi
+    # Centre-crop to the panel's aspect and downscale once (Lanczos), so every later
+    # show decodes a 4 MP image instead of 8 MP and nothing is rescaled again.
+    magick "$tmp/img[0]" -auto-orient -filter Lanczos -resize "${SIZE}^" -gravity center \
+        -extent "$SIZE" -strip -quality 92 -sampling-factor 4:2:0 "$tmp/fit.jpg" \
+        || { echo "resize failed: $2"; return 0; }
+    mv "$tmp/fit.jpg" "$DIR/$2"
+    printf '%s\t%s\t%s\n' "$2" "$3" "$4" >> "$CREDITS"
+    added=$((added + 1)); echo "added $2 (${5}x${6}): $3"
+}
+
+# Bing photo of the day, last 8 days
+curl -fsS --max-time 30 "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&uhd=1&uhdwidth=3840&uhdheight=2160&mkt=$MKT" \
+    -o "$tmp/bing.json" 2>/dev/null &&
+jq -r '.images[] | (.copyright // "") as $c | [.startdate, .urlbase, (($c | sub(" \\(©.*$"; "")) | if . == "" then "-" else . end), (($c | capture("\\((?<c>©[^)]*)\\)").c) // "-")] | @tsv' "$tmp/bing.json" 2>/dev/null |
+while IFS="$(printf '\t')" read -r date base title credit; do
+    name=$(printf %s "$base" | sed -n 's/.*OHR\.\([A-Za-z0-9]*\)_.*/\1/p')
+    [ -n "$name" ] || continue
+    fetch "https://www.bing.com${base}_UHD.jpg" "bing-$date-$name.jpg" "$title" "$credit"
+    echo "$added" > "$tmp/added.bing"
+done
+
+# Windows Spotlight, 1 per run
+curl -fsS --max-time 30 -A "$UA" \
+    "https://fd.api.iris.microsoft.com/v4/api/selection?placement=88000820&bcnt=1&country=$COUNTRY&locale=$MKT&fmt=json" \
+    -o "$tmp/spot.json" 2>/dev/null &&
+jq -r '.batchrsp.items[].item | fromjson | .ad | [.landscapeImage.asset, ((.title // "") | if . == "" then "-" else . end), ((.copyright // "") | if . == "" then "-" else . end)] | @tsv' "$tmp/spot.json" 2>/dev/null |
+while IFS="$(printf '\t')" read -r url title credit; do
+    [ -n "$url" ] || continue
+    id=$(printf %s "$url" | sha1sum | cut -c1-12)
+    fetch "$url" "spotlight-$id.jpg" "$title" "$credit"
+    echo "$added" > "$tmp/added.spot"
+done
+
+# Prune: keep the newest $KEEP photos
+ls -1t "$DIR"/bing-*.jpg "$DIR"/spotlight-*.jpg 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
+    rm -f "$old"; f=$(basename "$old")
+    grep -v "^$f	" "$CREDITS" > "$tmp/credits" && cat "$tmp/credits" > "$CREDITS"
+done
+if [ ! -s "$tmp/bing.json" ] && [ ! -s "$tmp/spot.json" ]; then
+    echo "no network (both feeds unreachable): will retry"; exit 75
+fi
+total=$(ls -1 "$DIR"/bing-*.jpg "$DIR"/spotlight-*.jpg 2>/dev/null | wc -l)
+# Today's wallpaper: the newest photo not shown yet, else the one shown longest ago.
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/wallpaper-feed; mkdir -p "$STATE"; touch "$STATE/shown"
+pick=$(ls -1t "$DIR"/bing-*.jpg "$DIR"/spotlight-*.jpg 2>/dev/null | while read -r f; do
+    grep -qxF "$(basename "$f")" "$STATE/shown" || { echo "$f"; break; }; done)
+if [ -z "$pick" ]; then
+    for f in $(cat "$STATE/shown"); do [ -e "$DIR/$f" ] && { pick="$DIR/$f"; break; }; done
+fi
+if [ -n "$pick" ] && pgrep -x noctalia >/dev/null; then
+    if noctalia msg wallpaper-set "$pick" >/dev/null 2>&1; then
+        f=$(basename "$pick"); { grep -vxF "$f" "$STATE/shown"; echo "$f"; } > "$STATE/shown.new"
+        mv "$STATE/shown.new" "$STATE/shown"
+        echo "wallpaper: $f ($(awk -F'\t' -v f="$f" '$1 == f {print $2; exit}' "$CREDITS"))"
+    fi
+fi
+echo "library: $total photos (+$(( $(cat "$tmp/added.bing" 2>/dev/null || echo 0) + $(cat "$tmp/added.spot" 2>/dev/null || echo 0) )) new)"

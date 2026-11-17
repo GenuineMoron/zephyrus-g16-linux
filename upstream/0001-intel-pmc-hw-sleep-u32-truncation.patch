@@ -1,0 +1,64 @@
+From: <author>
+Subject: [PATCH] platform/x86/intel/pmc: Don't truncate hardware sleep time to 32 bits
+
+pmc_core_is_s0ix_failed() reports the time spent in hardware sleep with
+
+	pm_report_hw_sleep_time((u32)(s0ix_counter - pmcdev->s0ix_counter));
+
+Both counter values are already scaled to microseconds by
+pmc_core_adjust_slp_s0_step(), so the u32 cast does not deal with a wrap
+of the 32-bit SLP_S0 residency register. Instead it truncates the result
+modulo 2^32 us, which is 71.6 minutes. Any s2idle period longer than that
+is under-reported in /sys/power/suspend_stats/last_hw_sleep and
+total_hw_sleep, while max_hw_sleep (set by the same driver) correctly
+advertises the full counter range of about 145 hours.
+
+Seen on a Meteor Lake-H laptop (ASUS GU605MI) after a 9331 s s2idle
+period that spent 9322.6 s in S0i2.1 according to the PMC substate
+residency counters:
+
+	last_hw_sleep:  732664908	(= 9322.6 s - 2 * 4294.967296 s)
+	max_hw_sleep:   523986009990
+
+User space that divides last_hw_sleep by the suspend time to judge
+whether s2idle worked reports a healthy night as "8% in S0ix".
+
+Compute the difference in the scaled domain and add one full counter
+period when the hardware counter wrapped.
+
+Fixes: ddd66d634735 ("platform/x86/intel/pmc: core: Report duration of time in HW sleep state")
+Reported-by: <reporter>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/platform/x86/intel/pmc/core.c
++++ b/drivers/platform/x86/intel/pmc/core.c
+@@ -2051,12 +2051,26 @@
+ 
+ static inline bool pmc_core_is_s0ix_failed(struct pmc_dev *pmcdev)
+ {
+-	u64 s0ix_counter;
++	struct pmc *pmc = pmcdev->pmcs[PMC_IDX_MAIN];
++	u64 s0ix_counter, hw_sleep;
+ 
+-	if (pmc_core_dev_state_get(pmcdev->pmcs[PMC_IDX_MAIN], &s0ix_counter))
++	if (pmc_core_dev_state_get(pmc, &s0ix_counter))
+ 		return false;
+ 
+-	pm_report_hw_sleep_time((u32)(s0ix_counter - pmcdev->s0ix_counter));
++	/*
++	 * Both readings are already scaled to microseconds, so truncating the
++	 * difference to u32 does not handle a wrap of the 32-bit hardware
++	 * counter: it cuts every s2idle period longer than ~71.6 minutes
++	 * down modulo 2^32 us. Handle the wrap in the scaled domain instead.
++	 */
++	if (s0ix_counter >= pmcdev->s0ix_counter)
++		hw_sleep = s0ix_counter - pmcdev->s0ix_counter;
++	else
++		hw_sleep = s0ix_counter - pmcdev->s0ix_counter +
++			   pmc_core_adjust_slp_s0_step(pmc, U32_MAX) +
++			   pmc_core_adjust_slp_s0_step(pmc, 1);
++
++	pm_report_hw_sleep_time(hw_sleep);
+ 
+ 	if (s0ix_counter == pmcdev->s0ix_counter)
+ 		return true;

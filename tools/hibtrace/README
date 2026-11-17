@@ -1,0 +1,36 @@
+hibtrace - diagnostic kernel module used 2026-11-14 to find why hibernate froze
+at power-off on this ROG Zephyrus G16 (GU605MI). Not loaded normally.
+
+While loaded it logs entry/return of the core hibernate path and the NVIDIA
+PM/shutdown functions, and arms a watchdog when hibernation starts. If
+hibernation is still running after watchdog_secs, it prints every blocked
+task's stack and every CPU's backtrace, then panics, so the log lands in
+firmware storage (EFI pstore) and the laptop restarts by itself.
+Needs: sysctl kernel.panic=10 and efi_pstore enabled (GRUB:
+efi_pstore.pstore_disable=0).
+
+Build:  make -C /lib/modules/$(uname -r)/build M=$PWD LLVM=1 modules
+Use:    sudo insmod hibtrace.ko watchdog_secs=120 ; (hibernate) ; sudo rmmod hibtrace
+
+After a panic, systemd-pstore archives the records at the next real boot
+(/var/lib/systemd/pstore). After a hibernate *restore* the pstore filesystem
+does not list them; read them straight from
+/sys/firmware/efi/efivars/dump-type0-*-cfc8fc79-be2e-4ddc-97f0-9f98bfe298a0
+(skip the 4-byte attribute header, then raw deflate: zlib.decompress(d, -15)).
+
+Finding: cs35l56_hda_system_suspend -> __flush_work waits for
+cs35l56_hda_dsp_work -> request_firmware -> btrfs read that never completes
+during hibernation (btrfs read completion runs on freezable workqueues).
+It is memory-dependent because hibernation evicts the page cache to make room.
+Fix: /usr/lib/systemd/system-sleep/30-cs35l56-hibernate detaches the amps for
+the hibernate step only. the health check (configs/usr/local/bin/g16-doctor) verifies the fix is still in place.
+
+Lessons:
+- Never write the RTC from here. A CMOS-year step marker made the clock jump
+  to 2115 on resume, because the kernel adds 100 years to two-digit years under
+  70 on top of the firmware century byte.
+- Calling non-exported kernel functions by a kprobe-looked-up address oopses
+  under CET IBT ("Missing ENDBR").
+- Runtime tracepoint_printk does nothing unless tp_printk was on the cmdline.
+
+Evidence: docs/findings/01-hibernate-hang-cs35l56.md

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Re-send the current performance mode (Silent/Balanced/Turbo) to the firmware after
+# every wake. Why: on the Zephyrus G16 GU605MI/MV/CR the EC can lose its thermal mode
+# across sleep while Linux keeps reporting the old one; G-Helper does exactly this for
+# these models (AppConfig.IsSleepReset -> ModeControl.SleepReset). The firmware does not
+# report its mode (WMI DSTS 0x00120075 reads a constant), so re-sending is the only
+# reliable fix. asusd re-sends it on wake only when the charger changed during sleep.
+# Writing the same value makes asus-wmi issue the WMI call again; asusd then re-syncs
+# the fan curves for that mode. Harmless when nothing was lost.
+[ "$1" = post ] || exit 0
+p=/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy
+[ -w "$p" ] || exit 0
+v=$(cat "$p") && echo "$v" > "$p"
+exit 0

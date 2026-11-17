@@ -1,0 +1,81 @@
+#!/bin/bash
+# Watches the internal panel's Panel Self Refresh (PSR). PSR lets the panel
+# refresh itself from its own memory while the screen is static; when it is off,
+# the display engine must send every frame (240 a second) to the panel.
+#   journalctl -t psr-watch
+# Two sources:
+# 1. Every 30 s, i915 debugfs: logs each change of the PSR state, with the lid,
+#    charger and backlight at the time. "disabled" with backlight 0 is normal
+#    (screen off); "disabled" with the backlight on is the case being hunted.
+# 2. A kprobe on i915:intel_psr_disable_locked with a stack trace, in a private
+#    ftrace instance (instances/psrwatch), so the code path that switched PSR
+#    off is in the journal right before the state change it caused.
+P=/sys/kernel/debug/dri/0000:00:02.0/i915_edp_psr_status
+T=/sys/kernel/tracing
+I=$T/instances/psrwatch
+EV='psrwatch/psroff'
+
+cleanup() {
+    kill "$poller" 2>/dev/null
+    echo 0 > "$I/events/$EV/enable" 2>/dev/null
+    echo '!stacktrace' > "$I/events/$EV/trigger" 2>/dev/null
+    rmdir "$I" 2>/dev/null
+    echo "-:$EV" >> "$T/kprobe_events" 2>/dev/null
+}
+trap cleanup EXIT
+
+poll() {
+    local last="" now lid ac
+    while :; do
+        if [ -r "$P" ]; then
+            now=$(awk '/^PSR mode:/ { sub(/^PSR mode: */, ""); m = $0 }
+                       /^  / { sub(/^ +/, ""); r = " (" $0 ")" }
+                       /^PSR sink not reliable: yes/ { r = r " (sink not reliable)" }
+                       END { print m r }' "$P" 2>/dev/null)
+            if [ -n "$now" ] && [ "$now" != "$last" ]; then
+                lid=$(awk 'NR == 1 { print $2 }' /proc/acpi/button/lid/*/state 2>/dev/null)
+                ac=$(cat /sys/class/power_supply/ACAD/online 2>/dev/null)
+                logger -t psr-watch "PSR ${last:-(start)} -> $now; lid ${lid:-?}, charger ${ac:-?}, panel backlight $(cat /sys/class/backlight/intel_backlight/actual_brightness 2>/dev/null || echo ?)"
+                last=$now
+            fi
+        fi
+        sleep 30
+    done
+}
+poll &
+poller=$!
+
+if grep -q "^p:$EV " "$T/kprobe_events" 2>/dev/null ||
+   echo "p:$EV i915:intel_psr_disable_locked" >> "$T/kprobe_events" 2>/dev/null; then
+    mkdir -p "$I"
+    echo stacktrace > "$I/events/$EV/trigger"
+    echo 1 > "$I/events/$EV/enable"
+    # Event line, then "<stack trace>", then " => frame" lines. Log one line
+    # per disable: the process and the first frames of the call path (flushed
+    # on the next event or after 2 s of quiet).
+    head="" stack="" n=0
+    flush() { [ -n "$head" ] && logger -t psr-watch "PSR switched off by $head via ${stack:-?}"; head="" stack="" n=0; }
+    while :; do
+        if IFS= read -r -t 2 line; then
+            case "$line" in
+                *psroff:*) flush; h=${line#"${line%%[![:space:]]*}"}; h=${h%% \[*}; h=${h%"${h##*[![:space:]]}"}
+                           pid=${h##*-}; comm=${h%-*}
+                           [ "$comm" = "<...>" ] && comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+                           head="$comm (pid $pid)" ;;
+                *"=> "*) f=${line#*=> }; f=${f%%+0x*}
+                         case "$f" in kprobe_*|init_module|ftrace_*|arch_ftrace_*|intel_psr_disable_locked) continue ;; esac
+                         if [ -n "$head" ] && [ "$n" -lt 10 ]; then
+                             stack+="${stack:+ < }$f"; n=$((n + 1))
+                         fi ;;
+            esac
+        elif [ $? -gt 128 ]; then
+            flush
+        else
+            break
+        fi
+    done < <(cat "$I/trace_pipe") &   # a real pipe: read -t does not time out on tracefs files
+    wait $!
+else
+    logger -t psr-watch "kprobe on i915:intel_psr_disable_locked unavailable; polling only"
+    wait "$poller"
+fi

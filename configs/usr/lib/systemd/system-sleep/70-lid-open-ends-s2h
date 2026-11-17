@@ -1,0 +1,62 @@
+#!/bin/sh
+# Keeps the laptop awake when the lid is opened around one of systemd's
+# battery-check wakes during suspend-then-hibernate.
+#
+# Why: systemd 262 wakes the laptop every SuspendEstimationSec (1 h) to measure
+# the battery, then suspends again at once without looking at the lid
+# (src/sleep/sleep.c, custom_timer_suspend). A lid opened just before or during
+# that wake is ignored and only the power button brings the laptop back
+# (seen 2026-11-15). The keyboard cannot wake it on Linux (docs/plan.md B23).
+#
+# How: "pre" records the lid state and the RTC wake counter. On "post", if the
+# lid was closed, is open now, and the RTC woke us (a battery check), it holds
+# two wake alarms (CLOCK_BOOTTIME_ALARM) at +2 s and +4 s. The kernel then
+# refuses systemd's immediate re-suspend (alarmtimer_suspend returns -EBUSY
+# when an alarm is due within 2 s), or, if the NVIDIA suspend notifier delays
+# things past that, the later alarm wakes it within seconds. Either way
+# systemd's loop ends and the laptop stays awake. Two alarms because the
+# NVIDIA notifier takes ~0.2 s with the GPU awake and ~2 s with it asleep.
+STATE=/run/lid-open-ends-s2h.state
+
+lid() { awk 'NR == 1 { print $2 }' /proc/acpi/button/lid/*/state 2>/dev/null; }
+rtc_wakes() {
+    n=0
+    for w in /sys/class/wakeup/*; do
+        case "$(cat "$w/name" 2>/dev/null)" in
+            PNP0B00*|alarmtimer*) n=$(( n + $(cat "$w/event_count" 2>/dev/null || echo 0) )) ;;
+        esac
+    done
+    echo "$n"
+}
+
+[ "$SYSTEMD_SLEEP_ACTION" = suspend ] || exit 0
+case "$1" in
+pre)
+    # Only inside suspend-then-hibernate (its service is still running).
+    if systemctl is-active --quiet systemd-suspend-then-hibernate.service ||
+       [ "$(systemctl show -P ActiveState systemd-suspend-then-hibernate.service)" = activating ]; then
+        echo "$(lid) $(rtc_wakes)" > "$STATE"
+    else
+        rm -f "$STATE"
+    fi
+    ;;
+post)
+    [ -f "$STATE" ] || exit 0
+    read -r lid0 rtc0 < "$STATE"
+    rm -f "$STATE"
+    lid1=$(lid); rtc1=$(rtc_wakes)
+    if [ "$lid0" = closed ] && [ "$lid1" = open ] && [ "${rtc1:-0}" -gt "${rtc0:-0}" ]; then
+        logger -t lid-open-wake "lid opened around a battery-check wake: holding wake alarms so the laptop stays awake"
+        systemd-run --quiet --collect --unit="lid-open-wake-hold-$(date +%s)" /usr/bin/python3 -I -c '
+import os, time
+fds = []
+for t in (2.0, 4.0):
+    fd = os.timerfd_create(9)          # CLOCK_BOOTTIME_ALARM
+    os.timerfd_settime(fd, initial=t)
+    fds.append(fd)
+time.sleep(8)
+' || logger -t lid-open-wake "could not start the wake-alarm holder"
+    fi
+    ;;
+esac
+exit 0

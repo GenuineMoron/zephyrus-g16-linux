@@ -1,0 +1,4 @@
+# Only the Exec= lines differ from /usr/share/applications/zen.desktop: each is prefixed with
+#   env __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json MOZ_DRM_DEVICE=/dev/dri/renderD128
+# Make it with:
+#   sed -E 's#^Exec=/opt/zen-browser-bin/zen-bin#Exec=env __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json MOZ_DRM_DEVICE=/dev/dri/renderD128 /opt/zen-browser-bin/zen-bin#' /usr/share/applications/zen.desktop > ~/.local/share/applications/zen.desktop

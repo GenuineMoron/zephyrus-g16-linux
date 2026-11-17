@@ -1,0 +1,222 @@
+#!/bin/bash
+# Read-only health check for the things on this laptop that an update can
+# quietly break. Silent when healthy; sends one desktop notification if not.
+#   g16-doctor                 full check (run 5 minutes after boot)
+#   g16-doctor --after-update  checks the newest installed kernel only
+#   g16-doctor --print         full check, printed instead of notified
+# Never touches the NVIDIA GPU directly, so it cannot keep it awake.
+#
+# Optional settings in /etc/default/g16-doctor (shell syntax):
+#   BACKUP_STAMP=/home/you/.local/state/backup/last-success
+#       a file your backup job touches after each successful run; the check
+#       warns when it is more than 3 days old.
+set -uo pipefail
+
+case "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" in
+    *GU605*) ;;
+    *) exit 0 ;; # written for the Zephyrus G16 2024; says nothing elsewhere
+esac
+
+INITRD=/boot/initramfs-linux-cachyos.img
+BACKUP_STAMP=
+[[ -r /etc/default/g16-doctor ]] && . /etc/default/g16-doctor
+
+# The NVIDIA GPU's runtime-PM state. vendor and class are cached by the kernel,
+# so reading them does not wake the GPU.
+GPU=
+for d in /sys/bus/pci/devices/*; do
+    [[ $(<"$d/vendor") == 0x10de && $(<"$d/class") == 0x03* ]] || continue
+    GPU=$d/power/runtime_status
+    break
+done
+
+mode=${1:-boot}
+problems=()
+fail() { problems+=("$1"); }
+
+vmd_has_fix() {
+    local ko=$1 tmp rc
+    command -v objdump >/dev/null || return 0 # can't tell; don't cry wolf
+    tmp=$(mktemp) || return 0
+    case $ko in
+        *.zst) zstd -qdc "$ko" >"$tmp" ;;
+        *.xz) xz -dc "$ko" >"$tmp" ;;
+        *) cat "$ko" >"$tmp" ;;
+    esac
+    objdump -dr --no-show-raw-insn "$tmp" 2>/dev/null \
+        | awk '/<vmd_irq>:/,/^$/' | grep -q '_raw_spin_lock'
+    rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+check_kernel() {
+    local k
+    k=$(ls -d /usr/lib/modules/*-cachyos 2>/dev/null | sort -V | tail -1)
+    k=${k##*/}
+    [[ -n $k ]] || { fail "No CachyOS kernel found in /usr/lib/modules"; return; }
+
+    modinfo -k "$k" -n nvidia >/dev/null 2>&1 \
+        || fail "NVIDIA driver is missing for kernel $k. Do not reboot yet."
+
+    # SSD freeze fix (Intel erratum MTL016, upstream 7307899e381c). Stock kernels
+    # have it from 7.3.4; older ones need vmd-mtl016-dkms. The fixed vmd_irq takes
+    # a spinlock to flush DMA writes, so check the module itself for that call.
+    local vmd
+    vmd=$(modinfo -k "$k" -n vmd 2>/dev/null)
+    if [[ -z $vmd ]]; then
+        fail "Kernel $k has no VMD storage driver, so it may not boot."
+    elif ! vmd_has_fix "$vmd"; then
+        fail "Kernel $k's SSD driver lacks the storage-freeze fix (MTL016). Rebuild vmd-mtl016-dkms before relying on it."
+    fi
+
+    if [[ -f $INITRD ]]; then
+        lsinitcpio -l "$INITRD" 2>/dev/null | grep -q 'vmd\.ko' \
+            || fail "The boot image has no VMD storage driver, so the next boot may fail."
+    else
+        fail "Boot image $INITRD is missing."
+    fi
+}
+
+check_booted() {
+    local cmdline token
+    cmdline=$(</proc/cmdline)
+    for token in pcie_aspm=force resume= resume_offset= nvidia.NVreg_DynamicPowerManagement=0x02; do
+        [[ $cmdline == *"$token"* ]] || fail "Boot option $token is missing, so sleep will be worse."
+    done
+
+    grep -q '\[s2idle\]' /sys/power/mem_sleep \
+        || fail "Standby is not using s2idle: $(cat /sys/power/mem_sleep)"
+
+    local swapfile want have
+    swapfile=$(swapon --show=NAME --noheadings | grep -v zram | head -1)
+    want=$(sed -n 's/.*resume_offset=\([0-9]*\).*/\1/p' /proc/cmdline)
+    if [[ -n $swapfile && -n $want ]]; then
+        have=$(btrfs inspect-internal map-swapfile -r "$swapfile" 2>/dev/null)
+        [[ $have == "$want" ]] \
+            || fail "Hibernate points at offset $want but the swap file is at $have. Hibernate would fail."
+    else
+        fail "No hibernate swap file is active."
+    fi
+
+    # Hibernate hangs at power-off unless the speaker amps are detached for it
+    # (30-cs35l56-hibernate). The hook finds them by this driver path; if a
+    # kernel update renames it, the hook silently does nothing.
+    local hook=/usr/lib/systemd/system-sleep/30-cs35l56-hibernate amps
+    if [[ ! -x $hook ]]; then
+        fail "The speaker-amp hibernate fix is missing ($hook). Hibernate will hang with heavy memory use."
+    else
+        amps=$(ls -d /sys/bus/spi/drivers/cs35l56-hda/spi*-CSC3556* 2>/dev/null | wc -l)
+        (( amps == 2 )) \
+            || fail "The speaker amps are not where the hibernate fix expects them ($amps of 2 found). Hibernate may hang."
+    fi
+
+    # Patched asusd (asusctl PR #404, lets the keyboard USB chips autosuspend).
+    # If the package moves on, the override keeps running the old build.
+    if [[ -f /etc/systemd/system/asusd.service.d/50-pr404.conf ]]; then
+        [[ "$(pacman -Q asusctl 2>/dev/null)" == "asusctl 6.5.0-1" ]] \
+            || fail "asusctl was updated ($(pacman -Q asusctl 2>/dev/null)) but asusd still runs the patched 6.5.0 build. Check whether PR #404 is in the new version; if so remove /etc/systemd/system/asusd.service.d/50-pr404.conf."
+        local h asus_hidraw=()
+        for h in /sys/class/hidraw/hidraw*; do
+            case "$(readlink -f "$h/device")" in *0B05:19B6*|*0B05:193B*) asus_hidraw+=("/dev/${h##*/}") ;; esac
+        done
+        (( ${#asus_hidraw[@]} == 0 )) || [[ -z "$(fuser "${asus_hidraw[@]}" 2>/dev/null)" ]] \
+            || fail "Something holds the ASUS keyboard/Slash hidraw nodes open (${asus_hidraw[*]}), so they cannot autosuspend (PC10 blocked)."
+        # usbhid refuses to autosuspend a keyboard while any of its LEDs is lit.
+        local led
+        for led in /sys/class/leds/input*::numlock; do
+            [[ $(<"$led/brightness") == 0 ]] \
+                || fail "Num Lock is on, which keeps the keyboard from autosuspending (PC10 blocked). This laptop has no numpad: check the compositor's numlock setting."
+            break
+        done
+    fi
+    # hid-asus backlight writes to a suspended keyboard (hid-asus-wake-dkms fixes it).
+    journalctl -k -b -q -g 'failed to set keyboard backlight' --no-pager 2>/dev/null | grep -q . \
+        && fail "Keyboard backlight writes failed this boot (-108). Is the hid-asus wake fix built for this kernel?"
+    # asusctl #690: ASUS keyboard firmware corrupting its USB context on resume.
+    journalctl -k -b -q -g 'invalid context state for evaluate context' --no-pager 2>/dev/null | grep -q . \
+        && fail "USB 'invalid context state' errors this boot (ASUS keyboard firmware bug, asusctl #690). Check the 10-asus-kbd-autosuspend sleep hook."
+
+    # Key remaps (Fn row) live in udev's compiled hwdb. A source newer than the
+    # compiled file means a change never took effect; /etc/udev/hwdb.bin, if
+    # present, overrides the one pacman keeps up to date.
+    local bin=/usr/lib/udev/hwdb.bin newer
+    [[ -e /etc/udev/hwdb.bin ]] && bin=/etc/udev/hwdb.bin
+    newer=$(find /etc/udev/hwdb.d /usr/lib/udev/hwdb.d -name '*.hwdb' -newer "$bin" 2>/dev/null | head -1)
+    [[ -z $newer ]] \
+        || fail "Key remap $newer is newer than $bin. Run: sudo systemd-hwdb --usr update && sudo rm -f /etc/udev/hwdb.bin"
+
+    local failed
+    failed=$(systemctl --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+    [[ -z $failed ]] || fail "Failed services: $failed"
+
+    # A timer that is running but will never fire (an empty OnXxxSec= in a
+    # drop-in resets every trigger, OnBootSec included).
+    local t key val real mono last dead=()
+    while read -r t _; do
+        real= mono= last=
+        while IFS='=' read -r key val; do
+            case $key in
+                NextElapseUSecRealtime) real=$val ;;
+                NextElapseUSecMonotonic) mono=$val ;;
+                LastTriggerUSec) last=$val ;;
+            esac
+        done < <(systemctl show "$t" -p NextElapseUSecRealtime -p NextElapseUSecMonotonic -p LastTriggerUSec)
+        [[ -z $real && ( -z $mono || $mono == infinity ) && ( -z $last || $last == n/a ) ]] && dead+=("$t")
+    done < <(systemctl list-units --type=timer --state=active --plain --no-legend 2>/dev/null)
+    (( ${#dead[@]} == 0 )) || fail "Timers that will never run: ${dead[*]}"
+
+    journalctl -k -b -q -g 'NVRM: Xid' --no-pager 2>/dev/null | grep -q . \
+        && fail "The NVIDIA GPU logged an Xid error this boot."
+
+    # The GPU should power off within a few minutes of being idle.
+    if [[ -n $GPU ]]; then
+        local i slept=0
+        for i in 1 2 3 4 5 6; do
+            [[ $(<"$GPU") == suspended ]] && { slept=1; break; }
+            sleep 30
+        done
+        (( slept )) || fail "The NVIDIA GPU stayed awake for 3 minutes. That is fine if a game was running."
+    fi
+
+    local used
+    used=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+    (( used < 92 )) || fail "System drive is ${used}% full."
+
+    if [[ -n $BACKUP_STAMP ]]; then
+        if [[ -f $BACKUP_STAMP ]]; then
+            (( $(date +%s) - $(stat -c %Y "$BACKUP_STAMP") < 259200 )) \
+                || fail "Last successful backup was more than 3 days ago."
+        else
+            fail "No backup has completed yet."
+        fi
+    fi
+}
+
+check_kernel
+if [[ $mode != --after-update ]]; then
+    check_booted
+fi
+
+if (( ${#problems[@]} == 0 )); then
+    [[ $mode == --print ]] && echo "All checks passed."
+    exit 0
+fi
+
+body=$(printf '%s\n' "${problems[@]}")
+if [[ $mode == --print ]]; then
+    echo "$body"
+    exit 1
+fi
+
+# One notification in each logged-in user's desktop session.
+echo "$body"
+for bus in /run/user/*/bus; do
+    [[ -S $bus ]] || continue
+    uid=${bus#/run/user/}; uid=${uid%/bus}
+    (( uid >= 1000 )) || continue
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+        notify-send -u critical -a "System check" "Your laptop needs attention" "$body"
+done
+exit 0

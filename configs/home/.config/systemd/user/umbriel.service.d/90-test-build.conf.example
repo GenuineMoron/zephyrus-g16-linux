@@ -1,0 +1,9 @@
+# TEMPORARY (2026-11-15): run the Umbriel test build with the two upstream fixes
+# (frame-retry backoff, umbriel#810; VRR rejection memory, umbriel#809), built from
+# ~/.local/src/umbriel branch test/combined. Remove this file to go back to /usr/bin/umbriel.
+# Safety: if the test build exits with an error, this drop-in deletes itself so the
+# next login uses the packaged Umbriel again.
+[Service]
+ExecStart=
+ExecStart=/usr/local/libexec/umbriel-test
+ExecStopPost=/bin/sh -c '[ "$SERVICE_RESULT" = success ] || { rm -f %h/.config/systemd/user/umbriel.service.d/90-test-build.conf; systemctl --user daemon-reload; }'

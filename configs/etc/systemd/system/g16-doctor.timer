@@ -1,0 +1,8 @@
+[Unit]
+Description=Laptop health check five minutes after boot
+
+[Timer]
+OnBootSec=5min
+
+[Install]
+WantedBy=timers.target

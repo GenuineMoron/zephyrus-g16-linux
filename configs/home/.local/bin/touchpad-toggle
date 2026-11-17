@@ -1,0 +1,14 @@
+#!/bin/sh
+# Touchpad on/off (F10 on the ROG keyboard). Umbriel includes
+# ~/.config/umbriel/touchpad.toml and reloads it when it changes, so the state also
+# survives a compositor restart or reboot, as on Windows. The file must always exist:
+# with a [drm] policy Umbriel refuses to load while an include is missing.
+f="${XDG_CONFIG_HOME:-$HOME/.config}/umbriel/touchpad.toml"
+if grep -qx 'enabled = false' "$f" 2>/dev/null; then
+    state=true; icon=hand-finger; text="Touchpad on"
+else
+    state=false; icon=hand-finger-off; text="Touchpad off"
+fi
+tmp="$f.tmp.$$"
+printf '# Touchpad on/off, flipped by F10 (~/.local/bin/touchpad-toggle). Keep this file.\n[input.touchpad]\nenabled = %s\n' "$state" > "$tmp" && mv -f "$tmp" "$f"
+noctalia msg osd-show "$icon" "$text" >/dev/null 2>&1

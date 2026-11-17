@@ -1,0 +1,11 @@
+[Unit]
+Description=Log changes of the internal panel's Panel Self Refresh state
+After=systemd-modules-load.service
+
+[Service]
+ExecStart=/usr/local/sbin/psr-watch
+SyslogIdentifier=psr-watch
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

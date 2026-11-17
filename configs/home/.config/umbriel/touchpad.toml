@@ -1,0 +1,3 @@
+# Touchpad on/off, flipped by F10 (~/.local/bin/touchpad-toggle). Keep this file.
+[input.touchpad]
+enabled = true

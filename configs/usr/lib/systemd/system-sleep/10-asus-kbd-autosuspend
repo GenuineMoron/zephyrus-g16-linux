@@ -1,0 +1,21 @@
+#!/bin/sh
+# Wake the ASUS keyboard/Slash USB controllers (0b05:19b6, 0b05:193b) before
+# any system sleep, and let them autosuspend again afterwards.
+# Why: asusctl #690 reports that the 19b6 keyboard firmware can corrupt its USB
+# context when it enters s2idle/hibernate while runtime-suspended, which makes
+# the xHCI reset every USB device on resume. With power/control=on the device
+# is resumed first, so system sleep sees it exactly as with stock settings.
+# Autosuspend while awake is set by /etc/udev/rules.d/71-asus-kbd-autosuspend.rules.
+set_ctrl() {
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = 0b05 ] || continue
+        case "$(cat "$d/idProduct" 2>/dev/null)" in
+            19b6|193b) echo "$1" > "$d/power/control" 2>/dev/null ;;
+        esac
+    done
+}
+case "$1" in
+    pre)  set_ctrl on ;;
+    post) set_ctrl auto ;;
+esac
+exit 0

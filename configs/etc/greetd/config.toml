@@ -1,0 +1,9 @@
+[terminal]
+vt = 1
+
+[default_session]
+# Graphical noctalia greeter, restricted to the Intel iGPU so its wlroots
+# compositor never opens the NVIDIA card. Logs into the Umbriel session;
+# if the greeter itself fails, tuigreet takes over in the same boot.
+command = "env WLR_DRM_DEVICES=/dev/dri/intel-igpu /usr/bin/noctalia-greeter-session -- --session Umbriel --user <your-user> || exec tuigreet --remember --asterisks --time --cmd start-umbriel"
+user = "greeter"

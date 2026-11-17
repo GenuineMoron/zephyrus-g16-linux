@@ -1,0 +1,79 @@
+#!/bin/sh
+# Follow the Noctalia theme accent outside the shell, whenever the palette changes
+# (a new wallpaper). Run as the post-hook of the "accent" user template, which
+# renders colors.primary into ~/.config/noctalia/generated/accent.txt.
+#
+#  Folder icons: the "Adwaita-Accent" icon theme. It holds Adwaita/MoreWaita
+#     folder and place icons recoloured from Adwaita blue to the accent hue, and
+#     inherits MoreWaita and Adwaita for everything else.
+#  App icon picks: every NAME.svg in ~/.local/share/theme-accent-sync/apps replaces
+#     that app icon, and Files (org.gnome.Nautilus) uses the accent folder.
+# The keyboard colour is the ROG Control plugin's job (Lighting -> Match theme colour).
+# Only runs when the accent changes. It takes about 0.1 s.
+set -eu
+CFG=${XDG_CONFIG_HOME:-$HOME/.config}
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/theme-accent-sync
+ICONS=${XDG_DATA_HOME:-$HOME/.local/share}/icons/Adwaita-Accent
+APPS=${XDG_DATA_HOME:-$HOME/.local/share}/theme-accent-sync/apps
+mkdir -p "$STATE"
+hex=$(tr -cd '0-9a-fA-F' < "$CFG/noctalia/generated/accent.txt" | cut -c1-6)
+[ ${#hex} -eq 6 ] || { echo "no accent colour"; exit 0; }
+
+# Rebuild only when the accent or the app icon picks change.
+sig="$hex $(cat "$APPS"/*.svg 2>/dev/null | md5sum | cut -c1-12)"
+[ "$(cat "$STATE/folders" 2>/dev/null)" = "$sig" ] && [ -d "$ICONS" ] && exit 0
+tmp="$ICONS.new.$$"; rm -rf "$tmp"; mkdir -p "$tmp/scalable/places" "$tmp/scalable/apps"
+python3 -I - "$hex" "$tmp/scalable/places" <<'PY'
+import colorsys, glob, os, re, sys
+accent, out = sys.argv[1], sys.argv[2]
+ar, ag, ab = (int(accent[i:i+2], 16) / 255 for i in (0, 2, 4))
+ah, al, asat = colorsys.rgb_to_hls(ar, ag, ab)
+# Theme accents are pastel; keep folders calm but clearly tinted.
+sat_scale = min(1.0, max(0.5, asat / 0.6))
+srcs = {}
+for d in ("/usr/share/icons/Adwaita/scalable/places", "/usr/share/icons/MoreWaita/scalable/places"):
+    for f in glob.glob(d + "/*.svg"):
+        srcs[os.path.basename(f)] = f          # MoreWaita overrides Adwaita, as in normal lookup
+def recolour(m):
+    h = m.group(1)
+    r, g, b = (int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+    hh, ll, ss = colorsys.rgb_to_hls(r, g, b)
+    if ss < 0.25 or not (0.50 <= hh <= 0.70):    # only Adwaita's blues (hue ~190-250 deg)
+        return m.group(0)
+    nr, ng, nb = colorsys.hls_to_rgb(ah, ll, ss * sat_scale)
+    return "#%02x%02x%02x" % (round(nr * 255), round(ng * 255), round(nb * 255))
+n = 0
+for name, path in srcs.items():
+    svg = open(path, encoding="utf-8").read()
+    new = re.sub(r"#([0-9a-fA-F]{6})\b", recolour, svg)
+    if new != svg:
+        open(os.path.join(out, name), "w", encoding="utf-8").write(new); n += 1
+print(f"folders: {n} icons recoloured to #{accent}")
+PY
+# App icons: the picks, then Files as the accent folder (a folder, not a filing cabinet).
+for f in "$APPS"/*.svg; do [ -f "$f" ] && cp "$f" "$tmp/scalable/apps/"; done
+[ -f "$tmp/scalable/places/folder.svg" ] && cp "$tmp/scalable/places/folder.svg" "$tmp/scalable/apps/org.gnome.Nautilus.svg"
+cat > "$tmp/index.theme" <<'EOF'
+[Icon Theme]
+Name=Adwaita-Accent
+Comment=Adwaita and MoreWaita with folders in the current Noctalia accent colour
+Inherits=MoreWaita,Adwaita,AdwaitaLegacy,hicolor
+Directories=scalable/places,scalable/apps
+
+[scalable/places]
+Context=Places
+Size=128
+MinSize=8
+MaxSize=512
+Type=Scalable
+
+[scalable/apps]
+Context=Applications
+Size=128
+MinSize=8
+MaxSize=512
+Type=Scalable
+EOF
+# Swap in atomically, then bump the directory mtime so running GTK apps reload it.
+old="$ICONS.old.$$"; [ -d "$ICONS" ] && mv "$ICONS" "$old"; mv "$tmp" "$ICONS"; rm -rf "$old"
+touch "$ICONS"; echo "$sig" > "$STATE/folders"

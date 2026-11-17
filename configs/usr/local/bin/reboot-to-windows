@@ -1,0 +1,8 @@
+#!/bin/sh
+# One-shot boot into Windows: sets UEFI BootNext to the "Windows Boot Manager"
+# entry, so the NEXT boot goes straight to Windows (no GRUB) and the one after
+# returns to CachyOS. The caller then reboots. Used by the noctalia power menu.
+set -eu
+num=$(efibootmgr | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} Windows Boot Manager.*/\1/p' | head -n1)
+[ -n "$num" ] || { echo "reboot-to-windows: no 'Windows Boot Manager' EFI entry found" >&2; exit 1; }
+efibootmgr --quiet --bootnext "$num"

@@ -1,0 +1,7 @@
+[Unit]
+Description=Laptop health check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/g16-doctor
+Nice=10

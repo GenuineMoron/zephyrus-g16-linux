@@ -1,0 +1,8 @@
+[Unit]
+Description=SearXNG private search (proxy; exits after 15 idle minutes)
+Requires=searxng-app.service
+After=searxng-app.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=15min 127.0.0.1:8889
+PrivateTmp=yes

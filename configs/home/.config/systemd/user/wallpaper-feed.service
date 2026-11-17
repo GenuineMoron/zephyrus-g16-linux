@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch curated real-photo wallpapers (Bing + Windows Spotlight) into ~/Pictures/Wallpapers
+Documentation=file://%h/.local/bin/wallpaper-feed
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/wallpaper-feed
+# 75 = network not up yet (e.g. right after login or resume): try again later
+Restart=on-failure
+RestartSec=10min
+SuccessExitStatus=0
+Nice=19
+IOSchedulingClass=idle

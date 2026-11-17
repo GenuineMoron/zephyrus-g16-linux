@@ -1,0 +1,32 @@
+# Local package (ROG Zephyrus G16 GU605MI, ASUS N-KEY keyboard 0b05:19b6).
+# Same pattern as vmd-mtl016-dkms: vendored source for one exact kernel, plus a fix.
+pkgname=hid-asus-wake-dkms
+pkgver=7.3.4.1
+pkgrel=1
+pkgdesc="hid-asus for linux-cachyos 7.3.4-1 that wakes an autosuspended ROG keyboard before backlight/Fn-lock writes"
+arch=('any')
+url="https://github.com/CachyOS/linux/blob/cachyos-7.3.4-1/drivers/hid/hid-asus.c"
+license=('GPL-2.0-only')
+depends=('dkms')
+source=("hid-asus.c.cachyos-7.3.4-1::https://raw.githubusercontent.com/CachyOS/linux/cachyos-7.3.4-1/drivers/hid/hid-asus.c"
+        "hid-ids.h::https://raw.githubusercontent.com/CachyOS/linux/cachyos-7.3.4-1/drivers/hid/hid-ids.h"
+        "0001-HID-asus-wake-the-keyboard-for-feature-reports.patch"
+        "Kbuild" "Makefile" "dkms.conf")
+sha256sums=('232ac34c4acd05b5ce029a8ec4a9cdc2a699a2582ead42ab9650713171db2109'
+            'f4ab2146002caa9b5c4e17c6f25609d21d0a3c9d278057e63713b5de3c3bed15'
+            '88f666901da9a956172fb57ea3246b68e7148bb697e93344ee314af8bbef4d62'
+            'c53897aa93648fc31c7d30fe16e21daa6c611be5d04b5d321a08beef8dce7400'
+            '1f010830822e51bb438bf4e421515ef9edc41a73ee8adadccf1e54891bbab0f1'
+            '54f96bb048afdc399473174aea7e49a71610f81185ae9cb3f6e0c6409f921b94')
+
+prepare() {
+  cp --remove-destination "$(readlink -f hid-asus.c.cachyos-7.3.4-1)" hid-asus.c
+  # Must be the exact CachyOS 7.3.4-1 file the patch was written against.
+  [ "$(git hash-object hid-asus.c)" = "7dc6417fe2622aa9e4b68dd6742e61f72f0ed9d3" ] || { echo "unexpected hid-asus.c base"; return 1; }
+  patch -p3 hid-asus.c < 0001-HID-asus-wake-the-keyboard-for-feature-reports.patch
+}
+
+package() {
+  local dest="$pkgdir/usr/src/hid-asus-wake-$pkgver"
+  install -Dm644 hid-asus.c hid-ids.h Kbuild Makefile dkms.conf -t "$dest"
+}

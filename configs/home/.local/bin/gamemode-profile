@@ -1,0 +1,13 @@
+#!/bin/sh
+# gamemode start/end hook for the ASUS platform profile.
+#   start: Performance (unlocks the GPU power ceiling + performance EPP)
+#   end:   back to the profile asusd uses for the CURRENT power source
+#          (AC profile on the charger, Battery profile on battery), instead of
+#          a hard-coded Balanced that left the laptop in Balanced on battery.
+case "$1" in
+start) exec asusctl profile set Performance ;;
+end)
+    if [ "$(cat /sys/class/power_supply/ACAD/online 2>/dev/null)" = 1 ]; then key="AC profile"; else key="Battery profile"; fi
+    p=$(asusctl profile get 2>/dev/null | sed -n "s/^$key //p")
+    exec asusctl profile set "${p:-Balanced}" ;;
+esac

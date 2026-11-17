@@ -1,0 +1,18 @@
+# Ghostty. Colours follow the wallpaper: Noctalia's built-in "ghostty" template
+# writes themes/noctalia and manages the `theme = noctalia` line, and reloads open
+# windows live. Reference: https://ghostty.org/docs/config
+
+# Same face and size as the system monospace (fontconfig → Geist Mono).
+font-family = Geist Mono
+font-size = 12
+
+# Matches the old Alacritty window: 100×30 cells, small even padding.
+window-width = 100
+window-height = 30
+window-padding-x = 6
+window-padding-y = 4
+window-padding-balance = true
+
+# Battery: a blinking cursor redraws the window twice a second for as long as it is open.
+cursor-style-blink = false
+theme = noctalia

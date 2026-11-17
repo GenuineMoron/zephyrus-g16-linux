@@ -1,0 +1,238 @@
+# Umbriel for the ASUS ROG Zephyrus G16 GU605MI (2024): the only session (niri removed 2026-11-15).
+# Based on Umbriel's shipped starting config (/usr/share/umbriel/config.toml), tuned for
+# this laptop: Intel-only compositor, 240 Hz OLED with HDR and its factory ICC, no blur
+# (idle power), and niri's familiar Noctalia keybinds.
+# Reference: https://docs.noctalia.dev/umbriel/   Check edits: umbriel config validate
+
+[general]
+# Nothing to autostart: Noctalia runs as noctalia.service and is also the polkit agent
+# ([shell] polkit_agent = true), so admin prompts match the theme.
+autostart = []
+# Sharp X11 apps and games on the 1.5x panel.
+xwayland_native_resolution = true
+
+# ------------------------------------------------------------------------------
+# GPUs: the compositor only opens the Intel iGPU, which drives the panel. The RTX 4070
+# stays runtime-suspended; games still find it themselves (Vulkan/PRIME), as under niri.
+# Trade-off (same as niri): HDMI and the NVIDIA USB-C port can't drive a monitor.
+[drm]
+ignored_pci_addresses = ["0000:01:00.0"]
+ignored_devices = ["/dev/dri/by-path/pci-0000:01:00.0-card", "/dev/dri/by-path/pci-0000:01:00.0-render"]
+
+# ------------------------------------------------------------------------------
+# Internal OLED: Samsung ATNA60DL01, 2560x1600, 48-240 Hz, HDR10 (400 nits full, 616 peak).
+[output.eDP-1]
+mode = "2560x1600@240"
+scale = 1.5
+# VRR off for now: on this i915 eDP, toggling VRR needs a full modeset, which Umbriel
+# 0.1.0 can't do, so it never turned on for games, and after an HDR switch it got stuck
+# ON (which disables PSR and costs battery). Umbriel issue #809; revisit after the fix.
+vrr = "disabled"
+hdr = "auto"                # HDR only for fullscreen HDR content; SDR desktop otherwise.
+sdr_white = 203             # SDR brightness while HDR is active (cd/m2).
+# ASUS factory calibration of this exact panel (from the Windows install; dE 0.34 sRGB).
+color_profile = "~/.local/share/icc/GU605MI_8086_834C41A3_CMDEF.icm"
+sdr_gamut = "srgb"          # Show untagged SDR (most apps) as true sRGB, as macOS/Windows do.
+                            # "native" gives the panel's vivid wide-gamut look (like niri).
+
+# ------------------------------------------------------------------------------
+# Input (mirrors the niri setup)
+[input.keyboard]
+# No numpad on the G16, and a lit Num Lock LED stops usbhid autosuspending the
+# keyboard (it refuses while any LED is on), which blocks PC10 (finding 06).
+numlock_toggle = false
+
+[input.touchpad]
+tap = true
+natural_scroll = true
+scroll_factor = 0.4
+
+[input.focus]
+follows_mouse = "sloppy"
+
+[input.cursor]
+theme = "capitaine-cursors"
+size = 24
+
+# ------------------------------------------------------------------------------
+# Keybinds: this table replaces the built-in set. Umbriel's defaults + niri's extras.
+[keybinds]
+# Apps and session
+"Mod+Return" = { action = "spawn ghostty", repeat = false }
+"Mod" = "spawn noctalia msg panel-toggle launcher"
+"Mod+Space" = "spawn noctalia msg panel-toggle launcher"
+"Mod+Ctrl+Space" = "spawn noctalia msg panel-toggle launcher /emo"
+"Mod+S" = "spawn noctalia msg panel-toggle control-center"
+"Mod+I" = "spawn noctalia msg settings-toggle"
+"Mod+V" = "spawn noctalia msg panel-toggle clipboard"
+"Mod+B" = { action = "spawn zen-browser", repeat = false }
+"Mod+E" = { action = "spawn nautilus", repeat = false }
+"Mod+Alt+L" = { action = "spawn noctalia msg session lock", repeat = false }
+"Mod+Shift+Q" = "spawn noctalia msg panel-toggle session"
+# Power button: power menu (power-key-menu.service holds logind's power-key lock
+# while Noctalia runs). Not while locked: the lock screen has its own buttons,
+# and the press still wakes the display.
+"XF86PowerOff" = { action = "spawn noctalia msg panel-toggle session", repeat = false, allow_when_inhibited = true }
+"Alt+Tab" = { action = "spawn noctalia msg window-switcher", repeat = false }
+"Mod+Q" = { action = "window-close", repeat = false }
+"Mod+Shift+Escape" = { action = "shortcuts-inhibit-toggle", allow_when_inhibited = true, repeat = false }
+"Ctrl+Alt+Delete" = "session-quit"
+
+# Screenshots (Noctalia). The ROG keyboard has no PrtSc key: F6 sends Print, and
+# Fn+F6 sends Win+Shift+S (the Windows snipping shortcut), so both start a region shot.
+"Print" = "spawn noctalia msg screenshot-region"
+"Mod+Shift+S" = "spawn noctalia msg screenshot-region"
+"Ctrl+Print" = "spawn noctalia msg screenshot-fullscreen"
+"Alt+Print" = "spawn noctalia msg screenshot-window"
+"Shift+Print" = "spawn noctalia msg screenshot-annotate"
+
+# Media, volume and brightness (through Noctalia so its OSD shows; work while locked)
+"XF86AudioRaiseVolume" = { action = "spawn noctalia msg volume-up", allow_when_locked = true }
+"XF86AudioLowerVolume" = { action = "spawn noctalia msg volume-down", allow_when_locked = true }
+"XF86AudioMute" = { action = "spawn noctalia msg volume-mute", allow_when_locked = true, repeat = false }
+"XF86AudioMicMute" = { action = "spawn noctalia msg mic-mute", allow_when_locked = true, repeat = false }
+"XF86AudioPlay" = { action = "spawn noctalia msg media toggle", allow_when_locked = true, repeat = false }
+"XF86AudioPause" = { action = "spawn noctalia msg media toggle", allow_when_locked = true, repeat = false }
+"XF86AudioNext" = { action = "spawn noctalia msg media next", allow_when_locked = true }
+"XF86AudioPrev" = { action = "spawn noctalia msg media previous", allow_when_locked = true }
+"XF86MonBrightnessUp" = { action = "spawn noctalia msg brightness-up", allow_when_locked = true }
+"XF86MonBrightnessDown" = { action = "spawn noctalia msg brightness-down", allow_when_locked = true }
+
+# ROG keyboard (Zephyrus G16). The top row does its printed function and Fn gives
+# F1-F12, as G-Helper's Fn-Lock: /etc/udev/hwdb.d/90-asus-g16-fnkeys.hwdb.
+# F2/F3 (keyboard light) and Fn+F5 are handled in the kernel; F11 (sleep) by logind.
+"XF86Launch3" = { action = "spawn noctalia msg plugin genuinemoron/rog-control:service all next-aura", repeat = false }       # F4 Aura
+"XF86Launch4" = { action = "spawn noctalia msg plugin genuinemoron/rog-control:service all next-profile", repeat = false }    # F5 fan mode
+"XF86Display" = { action = "spawn noctalia msg panel-toggle control-center monitor", repeat = false }                         # F9
+"Mod+P" = { action = "spawn noctalia msg panel-toggle control-center monitor", repeat = false }                               # Fn+F9 (Win+P)
+"XF86TouchpadToggle" = { action = "spawn touchpad-toggle", allow_when_locked = true, repeat = false }                          # F10
+"XF86RFKill" = { action = "spawn airplane-toggle", allow_when_locked = true, repeat = false }                                  # Fn+F12
+"XF86Launch1" = { action = "spawn noctalia msg panel-toggle genuinemoron/rog-control:panel", repeat = false }                 # M4 (ROG key)
+
+# Focus and movement
+"Mod+Left" = "window-focus-left"
+"Mod+Down" = "window-focus-down"
+"Mod+Up" = "window-focus-up"
+"Mod+Right" = "window-focus-right"
+"Mod+H" = "window-focus-left"
+"Mod+J" = "window-focus-down"
+"Mod+K" = "window-focus-up"
+"Mod+L" = "window-focus-right"
+"Mod+Shift+Left" = "column-move-left"
+"Mod+Shift+Down" = "window-move-down"
+"Mod+Shift+Up" = "window-move-up"
+"Mod+Shift+Right" = "column-move-right"
+"Mod+WheelUp" = "window-focus-left"
+"Mod+WheelDown" = "window-focus-right"
+
+# Window state and layout
+"Mod+T" = { action = "window-toggle-floating", repeat = false }
+"Mod+Shift+T" = { action = "window-focus-switch-floating", repeat = false }
+"Mod+Shift+P" = { action = "window-toggle-pinned", repeat = false }
+"Mod+M" = { action = "window-toggle-maximize-to-edges", repeat = false }
+"Mod+F" = { action = "window-toggle-fullscreen", repeat = false }
+"Mod+Ctrl+F" = { action = "window-toggle-maximize", repeat = false }
+"Mod+R" = "window-cycle-primary-extent"
+"Mod+Shift+R" = "window-cycle-primary-extent-back"
+"Mod+Minus" = "window-modify-primary-extent -0.05"
+"Mod+Equal" = "window-modify-primary-extent +0.05"
+"Mod+Ctrl+Minus" = "window-modify-secondary-extent -0.05"
+"Mod+Ctrl+Equal" = "window-modify-secondary-extent +0.05"
+"Mod+Comma" = "window-consume-left"
+"Mod+Period" = "window-consume-right"
+"Mod+W" = { action = "column-toggle-tabbed", repeat = false }
+"Mod+O" = { action = "overview-toggle", repeat = false }
+
+# Workspaces
+"Mod+1" = "workspace-switch 1"
+"Mod+2" = "workspace-switch 2"
+"Mod+3" = "workspace-switch 3"
+"Mod+4" = "workspace-switch 4"
+"Mod+5" = "workspace-switch 5"
+"Mod+6" = "workspace-switch 6"
+"Mod+7" = "workspace-switch 7"
+"Mod+8" = "workspace-switch 8"
+"Mod+9" = "workspace-switch 9"
+"Mod+Shift+1" = "window-move-to-workspace 1"
+"Mod+Shift+2" = "window-move-to-workspace 2"
+"Mod+Shift+3" = "window-move-to-workspace 3"
+"Mod+Shift+4" = "window-move-to-workspace 4"
+"Mod+Shift+5" = "window-move-to-workspace 5"
+"Mod+Shift+6" = "window-move-to-workspace 6"
+"Mod+Shift+7" = "window-move-to-workspace 7"
+"Mod+Shift+8" = "window-move-to-workspace 8"
+"Mod+Shift+9" = "window-move-to-workspace 9"
+
+# Scratchpad
+"Mod+Shift+Space" = { action = "window-move-to-scratchpad", repeat = false }
+"Mod+Tab" = "scratchpad-toggle"
+
+# ------------------------------------------------------------------------------
+[layout]
+extent_presets = [0.333, 0.5, 0.667]
+gap = 8                     # logical px between windows and to the screen edges
+
+# Window look: rounded corners, a 1 px border (colours come from Noctalia's theme via
+# noctalia.toml: accent when focused), soft shadow. No blur (idle power).
+[appearance]
+corner_radius = 14
+border_width = 1
+outer_border_width = 0
+
+[appearance.shadow]
+enabled = true
+softness = 24
+offset_x = 0
+offset_y = 6
+
+[colors]
+shadow = "#00000066"
+
+[layout.scrolling]
+default_extent_fraction = 0.5
+
+# ------------------------------------------------------------------------------
+# Window rules. No blur anywhere: Umbriel issue #473 measured idle CPU 9% -> 17-20%
+# with blur at 165 Hz, and this laptop runs at 240 Hz on battery.
+[[window_rule]]
+match.app_id = "^dev.noctalia.Noctalia$"
+default_floating = true
+default_floating_size_px = { width = 1020, height = 900 }
+
+[[window_rule]]
+match.app_id = "^dev.noctalia.UmbrielSharePicker$"
+default_floating = true
+default_floating_size_px = { width = 800, height = 600 }
+
+[[window_rule]]
+match.title = "^(Picture-in-Picture|Picture in picture)$"
+default_floating = true
+default_maximize = false
+default_position = { x = 20, y = 20, anchor = "bottom_right" }
+
+[[window_rule]]
+match.title = "^notificationtoasts_.+_desktop"
+default_position = { x = 0, y = 0, anchor = "bottom_right" }
+default_focused = false
+default_pinned = true
+
+# Games: VRR always while a Steam game window exists; keep the pointer inside.
+[[window_rule]]
+match.app_id = "^steam_app_.*$"
+confine_pointer = true
+
+# Password manager hidden from screenshots and screen shares.
+[[window_rule]]
+match.app_id = "^[Bb]itwarden"
+block_capture = true
+
+# ------------------------------------------------------------------------------
+[hot_corners.top_left]
+enabled = true
+delay_ms = 500
+action = "overview-open"
+
+[include.optional]
+# touchpad.toml holds the F10 touchpad switch (written by touchpad-toggle). Keep the file:
+# with a [drm] policy, Umbriel won't load while any include is missing.
+files = ["noctalia.toml", "touchpad.toml"]

@@ -1,0 +1,4 @@
+# Copy to /etc/default/g16-doctor. Shell syntax.
+# A file your backup job touches after each successful run; g16-doctor warns
+# when it is more than 3 days old. Leave unset to skip the backup check.
+#BACKUP_STAMP=/home/you/.local/state/backup/last-success

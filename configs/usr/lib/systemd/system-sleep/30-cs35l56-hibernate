@@ -1,0 +1,37 @@
+#!/bin/sh
+# Fix (2026-11-14): hibernate froze at power-off whenever lots of memory
+# was in use. Proven with a kernel watchdog + firmware-stored crash log:
+#   - after the image is saved, the CS35L56 speaker-amp driver reloads its
+#     firmware from disk (cs35l56_hda_dsp_work -> request_firmware);
+#   - hibernate had pushed those files out of memory to make room, so it needs a
+#     btrfs read, and btrfs cannot finish reads while hibernate has its I/O
+#     workers frozen (known upstream issue, no fix yet);
+#   - the device power-off step then waits for that reload forever
+#     (cs35l56_hda_system_suspend -> flush_work).
+# Fix: detach the amps for the hibernate step only and reattach them afterwards
+# (they reload their firmware in ~0.3 s once the system is back).
+DRV=/sys/bus/spi/drivers/cs35l56-hda
+STATE=/run/cs35l56-detached
+action=${SYSTEMD_SLEEP_ACTION:-$2}
+log() { echo "cs35l56-hibernate: $*" | systemd-cat -t cs35l56-hibernate 2>/dev/null; }
+
+case "$1" in
+pre)
+    case "$action" in hibernate|hybrid-sleep) ;; *) exit 0 ;; esac
+    [ -d "$DRV" ] || exit 0
+    : > "$STATE"
+    # Reverse order: the amps share a reset line that the first one asserts on removal.
+    for d in $(ls -d "$DRV"/spi*-CSC3556* 2>/dev/null | sort -r); do
+        n=${d##*/}
+        if echo "$n" > "$DRV/unbind" 2>/dev/null; then echo "$n" >> "$STATE"; fi
+    done
+    log "detached for $action: $(tr '\n' ' ' < "$STATE")"
+    ;;
+post)
+    [ -f "$STATE" ] || exit 0
+    for n in $(sort "$STATE"); do echo "$n" > "$DRV/bind" 2>/dev/null; done
+    log "reattached: $(tr '\n' ' ' < "$STATE")"
+    rm -f "$STATE"
+    ;;
+esac
+exit 0

@@ -1,0 +1,110 @@
+# Excerpt of ~/.local/state/noctalia/settings.toml (Noctalia 5.4.1): the sections that define
+# the look (bar, widgets, wallpaper, theme, Control Centre, plugins). Apply with
+# `noctalia msg config-set <key> <value>` or merge by hand; the full file also holds
+# personal sections (calendar, session actions) that are not in the repo.
+
+[bar.default]
+background_opacity = 1.0
+capsule = true
+capsule_fill = "surface_container"
+capsule_opacity = 1.0
+center = [ "ps_center_l", "clock", "ps_center_r" ]
+compositor_blur = false
+end = [ "tray", "wallpaper", "clipboard", "notifications", "control-center", "battery", "session", "ps_end" ]
+font_family = "Inter Medium"
+margin_edge = 0
+margin_ends = 0
+padding = 10
+position = "left"
+radius = 0
+shadow = false
+start = [ "ps_start", "launcher", "workspaces", "sysmon" ]
+thickness = 42
+widget_spacing = 8
+
+[control_center]
+shortcuts = [
+    { type = "wifi" },
+    { type = "bluetooth" },
+    { type = "rylos/tailnet:toggle" },
+    { type = "icefish/phone-connect:tile" },
+    { type = "nightlight" },
+    { type = "notification" }
+]
+
+[plugin_settings."rylos/tailnet"]
+poll_interval = 60
+
+[plugins]
+enabled = [ "noctalia/umbriel-companion", "mgeldi/pixel-shift", "icefish/phone-connect", "rylos/tailnet" ]
+
+[theme]
+builtin = "Noctalia"
+community_palette = "Oxocarbon"
+mode = "dark"
+source = "wallpaper"
+wallpaper_scheme = "m3-tonal-spot"
+
+    [theme.templates]
+    builtin_ids = [ "gtk3", "gtk4", "kcolorscheme", "alacritty", "umbriel" ]
+    community_ids = [ "zen-browser", "obsidian", "telegram" ]
+
+        [theme.templates.user.accent]
+        input_path = "templates/accent.txt"
+        output_path = "~/.config/noctalia/generated/accent.txt"
+        post_hook = "~/.local/bin/theme-accent-sync"
+
+[wallpaper]
+directory = "~/Pictures/Wallpapers"
+transition = [ "fade" ]
+transition_duration = 2000
+
+    [wallpaper.automation]
+    enabled = false
+    order = "random"
+
+    [wallpaper.default]
+    path = "~/Pictures/Wallpapers/bing-20261111-Atlantica.jpg"
+
+    [wallpaper.last]
+    path = "~/Pictures/Wallpapers/bing-20261111-Atlantica.jpg"
+
+    [wallpaper.monitors.eDP-1]
+    path = "~/Pictures/Wallpapers/bing-20261111-Atlantica.jpg"
+
+[widget.clock]
+scale = 1.0
+vertical_format = """{:%H
+%M}"""
+
+[widget.launcher]
+custom_image = "/usr/share/icons/cachyos.svg"
+custom_image_colorize = true
+scale = 1.3
+
+[widget.ps_center_l]
+type = "mgeldi/pixel-shift:spacer"
+
+[widget.ps_center_r]
+type = "mgeldi/pixel-shift:spacer"
+
+[widget.ps_end]
+type = "mgeldi/pixel-shift:spacer"
+
+[widget.ps_start]
+type = "mgeldi/pixel-shift:spacer"
+
+[widget.sysmon]
+stat = "cpu_usage"
+
+[widget.wallpaper]
+glyph = "photo"
+
+    [widget.wallpaper.actions]
+    right = "wallpaper-random"
+    scroll_down = "wallpaper-next"
+    scroll_up = "wallpaper-previous"
+
+[widget.workspaces]
+show_labels = false
+style = "regular"

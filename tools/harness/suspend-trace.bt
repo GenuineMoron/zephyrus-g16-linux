@@ -1,0 +1,142 @@
+// suspend-trace.bt - arm BEFORE a suspend. Stamps every stage from lid close to the first frame
+// on eDP-1 after wake, all in CLOCK_BOOTTIME (nsecs(boot)), which keeps counting across s2idle.
+//
+// Preferred: run through suspend-arm.sh (it starts this in the background and records the anchor).
+// Direct:    sudo bpftrace tools/harness/suspend-trace.bt > out/suspend-X.log
+// Analyse:   python3 tools/harness/suspend-report.py out/suspend-X.log
+//
+// Output lines:  T <TAG> <boot_ns> [key=value ...]
+//   LID               EV_SW SW_LID event (value 1 = closed)          fentry:input_event
+//   SLEEP_EXEC/EXIT   systemd-sleep hooks (system-sleep/*)           sched_process_exec/exit
+//   PM                every power:suspend_resume step (freeze, suspend_enter, machine_suspend, resume_console...)
+//   I915_SUSPEND*     i915 display suspend / late suspend            fentry
+//   BACKLIGHT_OFF     any i915 *disable_backlight / backlight_disable  fentry (func= tells which)
+//   PIPE_DISABLE      display pipe disabled (pipe A = eDP-1)         tracepoint i915:intel_pipe_disable
+//   WAKE              machine_suspend END = firmware returned (wake)  power:suspend_resume
+//   FIRST_IRQ         first hardware IRQ after WAKE (name = source)   irq:irq_handler_entry
+//   WAKESRC           wakeup source activated after WAKE (first 50)  power:wakeup_source_activate
+//   WAKE_RESUME_LATE  i915 display resume (pm_resume_early / pm_resume) after WAKE
+//   WAKE_COMMIT       first atomic pipe update on pipe A after WAKE  i915:intel_pipe_update_end
+//   WAKE_FLIP_DONE    first flip completed on pipe A after WAKE      i915:intel_crtc_flip_done
+//   WAKE_FRAME        first flip event delivered to a DRM client (niri) on crtc 0 after WAKE
+// Re-arms on every WAKE, so several cycles in one run are fine.
+//
+// Limits: the ACPI wake IRQ itself is not visible here (FIRST_IRQ is the first IRQ the kernel
+// handles after firmware returns, which is usually the wake source or a timer). PM steps are
+// the kernel's view; userspace (logind, systemd-sleep hooks) is only covered by SLEEP_* lines.
+// bpftrace is a userspace process, so it is frozen during the suspend and prints when it resumes
+// (buffered kernel events are not lost).
+
+BEGIN {
+    printf("T ARMED %lld\n", nsecs(boot));
+}
+
+// --- entry: lid, sleep hooks, display off, kernel freeze ---------------------------------
+fentry:vmlinux:input_event
+/args.type == 5 && args.code == 0/
+{
+    printf("T LID %lld value=%d\n", nsecs(boot), args.value);
+}
+
+tracepoint:sched:sched_process_exec
+/comm == "systemd-sleep"/
+{
+    printf("T SLEEP_EXEC %lld pid=%d\n", nsecs(boot), pid);
+}
+
+tracepoint:sched:sched_process_exit
+/comm == "systemd-sleep"/
+{
+    printf("T SLEEP_EXIT %lld pid=%d\n", nsecs(boot), pid);
+}
+
+tracepoint:power:suspend_resume
+{
+    printf("T PM %lld %s start=%d val=%d\n", nsecs(boot), str(args.action), args.start, args.val);
+}
+
+fentry:i915:intel_display_driver_pm_suspend
+{
+    printf("T I915_SUSPEND %lld\n", nsecs(boot));
+}
+
+fentry:i915:intel_display_driver_pm_suspend_late
+{
+    printf("T I915_SUSPEND_LATE %lld\n", nsecs(boot));
+}
+
+fentry:i915:*disable_backlight
+{
+    printf("T BACKLIGHT_OFF %lld func=%s\n", nsecs(boot), func);
+}
+
+fentry:i915:intel_backlight_disable
+{
+    printf("T BACKLIGHT_OFF %lld func=%s\n", nsecs(boot), func);
+}
+
+tracepoint:i915:intel_pipe_disable
+/args.pipe_name == 65/
+{
+    printf("T PIPE_DISABLE %lld pipe=A\n", nsecs(boot));
+}
+
+// --- wake: machine_suspend END = firmware returned ---------------------------------------
+tracepoint:power:suspend_resume
+/str(args.action) == "machine_suspend" && args.start == 0/
+{
+    @woke = 1;
+    @got_irq = 0;
+    @got_resume = 0;
+    @got_commit = 0;
+    @got_flip_done = 0;
+    @got_frame = 0;
+    @wakesrc_n = 0;
+    printf("T WAKE %lld\n", nsecs(boot));
+}
+
+tracepoint:irq:irq_handler_entry
+/@woke == 1 && @got_irq == 0/
+{
+    @got_irq = 1;
+    printf("T FIRST_IRQ %lld irq=%d name=%s\n", nsecs(boot), args.irq, str(args.name));
+}
+
+tracepoint:power:wakeup_source_activate
+/@woke == 1 && @got_frame == 0 && @wakesrc_n < 50/
+{
+    @wakesrc_n++;
+    printf("T WAKESRC %lld %s\n", nsecs(boot), str(args.name));
+}
+
+fentry:i915:intel_display_driver_pm_resume_early
+/@woke == 1 && @got_resume == 0/
+{
+    @got_resume = 1;
+    printf("T WAKE_RESUME_LATE %lld\n", nsecs(boot));
+}
+
+tracepoint:i915:intel_pipe_update_end
+/@woke == 1 && @got_commit == 0 && args.pipe_name == 65/
+{
+    @got_commit = 1;
+    printf("T WAKE_COMMIT %lld\n", nsecs(boot));
+}
+
+tracepoint:i915:intel_crtc_flip_done
+/@woke == 1 && @got_flip_done == 0 && args.pipe_name == 65/
+{
+    @got_flip_done = 1;
+    printf("T WAKE_FLIP_DONE %lld\n", nsecs(boot));
+}
+
+tracepoint:drm:drm_vblank_event_delivered
+/@woke == 1 && @got_frame == 0 && args.crtc == 0/
+{
+    @got_frame = 1;
+    printf("T WAKE_FRAME %lld seq=%u\n", nsecs(boot), args.seq);
+}
+
+END {
+    printf("T END %lld\n", nsecs(boot));
+}

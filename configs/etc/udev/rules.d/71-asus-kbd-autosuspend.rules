@@ -1,0 +1,7 @@
+# Let the ASUS N-KEY keyboard controller (0b05:19b6) and the Slash LED bar
+# controller (0b05:193b) runtime-suspend when idle. While they are awake the
+# xHCI's latency tolerance keeps the CPU package out of PC10 (screen off: 0.4%
+# vs ~65% PC10, ~0.8 W; docs/findings/06). Needs an asusd that does not keep
+# /dev/hidraw* open (asusctl PR #404). A sleep hook (10-asus-kbd-autosuspend)
+# wakes them before system sleep because of asusctl #690.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0b05", ATTR{idProduct}=="19b6|193b", TEST=="power/control", ATTR{power/control}="auto"

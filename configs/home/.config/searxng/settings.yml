@@ -1,0 +1,44 @@
+# SearXNG: private metasearch for this laptop only (http://127.0.0.1:8888).
+# Started on first use by systemd socket activation and stopped after 15 idle
+# minutes (~/.config/systemd/user/searxng*.{socket,service}), so it costs nothing
+# while unused. Everything not set here comes from SearXNG's own defaults.
+use_default_settings:
+  engines:
+    # Wikipedia, Wikidata and OpenStreetMap insist on a contact address in every
+    # request (general.contact_url). Left off rather than attach personal details;
+    # add a contact_url here to enable them. Ahmia and Torch need Tor.
+    remove: [wikipedia, wikidata, openstreetmap, ahmia, torch]
+
+general:
+  instance_name: "Search"
+  enable_metrics: false          # no per-engine stats kept on disk or in memory
+
+search:
+  safe_search: 0
+  autocomplete: "duckduckgo"
+  default_lang: "auto"
+  formats: [html, json]          # json lets scripts and tools query it
+
+server:
+  bind_address: "127.0.0.1"      # informational: granian binds the unix socket below
+  port: 8888
+  secret_key: "<generate: openssl rand -hex 32>"
+  limiter: false                 # single user, local only: no bot protection needed
+  public_instance: false
+  image_proxy: false
+  method: "GET"                  # GET so the browser address bar and history work
+
+valkey:
+  url: false                     # no Valkey daemon: nothing that needs it is enabled
+
+ui:
+  default_theme: simple
+  theme_args:
+    simple_style: auto           # follows the system light/dark setting
+  query_in_title: true
+  infinite_scroll: true
+  center_alignment: true
+
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 8.0

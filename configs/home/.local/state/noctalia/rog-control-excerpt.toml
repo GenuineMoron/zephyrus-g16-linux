@@ -1,0 +1,4 @@
+# Excerpt of ~/.local/state/noctalia/settings.toml (Noctalia writes this file).
+# ROG Control: this GU605MI-QR081W has a single-colour (white) keyboard backlight.
+[plugin_settings."genuinemoron/rog-control"]
+rgb_keyboard = false

@@ -1,0 +1,52 @@
+#!/bin/sh
+# Keyboard backlight off after a period of no input, back to the previous level
+# on the first input, as Armoury Crate does on Windows (60 s on this laptop).
+# The light costs ~0.5 W at idle at level 2 (docs/research/31-screen-on-idle-ab.md).
+# Called by noctalia's idle behavior "keyboard-light":
+#   kbd-light-idle off       (idle timeout reached)
+#   kbd-light-idle restore   (input again)
+# Uses logind's SetBrightness, so it needs neither root nor asusd.
+L=/sys/class/leds/asus::kbd_backlight/brightness
+S=${XDG_RUNTIME_DIR:-/tmp}/kbd-light-idle.level
+
+# The keyboard USB controller autosuspends ~2 s after the last key press
+# (71-asus-kbd-autosuspend.rules), and the kernel's backlight write to a suspended
+# keyboard fails ("Asus failed to set keyboard backlight: -108": hid-asus sends it
+# without a runtime-PM wake). Waking it first makes the change land. Re-sending
+# asusd's current LedPower (which light zones are on when awake/asleep) does that
+# without side effects: asusd writes it through the keyboard's hidraw node, and
+# opening that resumes the device (asusctl PR #404 opens it per write). Unlike
+# re-sending LedMode, it doesn't re-apply asusd's own brightness.
+wake_keyboard() {
+    p=$(busctl --system tree xyz.ljones.Asusd 2>/dev/null | grep -o '/xyz/ljones/aura/19b6[a-z0-9_]*' | head -n1)
+    [ -n "$p" ] || return 0
+    # "a(ubbbb) 1 1 true true false false" -> signature + values, passed back as-is
+    v=$(busctl --system get-property xyz.ljones.Asusd "$p" xyz.ljones.Aura LedPower 2>/dev/null) || return 0
+    # shellcheck disable=SC2086
+    busctl --system set-property xyz.ljones.Asusd "$p" xyz.ljones.Aura LedPower $v 2>/dev/null
+}
+
+set_level() {
+    wake_keyboard
+    busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto \
+        org.freedesktop.login1.Session SetBrightness ssu leds asus::kbd_backlight "$1" >/dev/null 2>&1
+}
+
+case "$1" in
+off)
+    lv=$(cat "$L" 2>/dev/null) || exit 0
+    if [ "${lv:-0}" -gt 0 ]; then
+        echo "$lv" > "$S"
+        set_level 0
+    fi
+    ;;
+restore)
+    [ -f "$S" ] || exit 0
+    lv=$(cat "$S"); rm -f "$S"
+    # Only restore if nobody changed the light while idle.
+    [ "$(cat "$L" 2>/dev/null)" = 0 ] && set_level "$lv"
+    ;;
+*)
+    echo "usage: $0 off|restore" >&2; exit 2 ;;
+esac
+exit 0

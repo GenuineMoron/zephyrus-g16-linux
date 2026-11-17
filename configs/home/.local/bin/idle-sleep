@@ -1,0 +1,55 @@
+#!/bin/bash
+# Sleep on idle, on battery only (macOS-style). Run by Noctalia's idle behavior
+# "sleep-on-battery":
+#   idle-sleep start    after 15 idle minutes: start the watcher below
+#   idle-sleep cancel   on activity: stop it
+# The watcher checks once a minute and suspends (suspend-then-hibernate, like
+# the lid) when the laptop is on battery, no audio is playing and nothing holds
+# a sleep block. On the charger it only waits, so unplugging while idle still
+# leads to sleep. Video players and browsers showing video already block idle
+# through Wayland, so this only has to care about audio.
+set -u
+UNIT=idle-sleep-watch
+
+on_battery() {
+    local s
+    for s in /sys/class/power_supply/*; do
+        [[ $(<"$s/type") == Mains ]] || continue
+        [[ $(<"$s/online") == 0 ]] && return 0
+        return 1
+    done
+    return 1 # no charger found: a desktop, never sleep here
+}
+
+audio_playing() {
+    pactl -f json list sink-inputs 2>/dev/null | jq -e 'any(.[]; .corked == false)' >/dev/null
+}
+
+# logind's list: (what, who, why, mode, uid, pid); "what" is colon-separated.
+sleep_blocked() {
+    busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager ListInhibitors 2>/dev/null |
+        jq -e '.data[0] | any(.[]; (.[0] | split(":") | index("sleep")) != null and .[3] == "block")' >/dev/null
+}
+
+watch() {
+    while :; do
+        sleep 60
+        on_battery || continue
+        audio_playing && continue
+        sleep_blocked && continue
+        logger -t idle-sleep "idle on battery: suspending"
+        systemctl suspend-then-hibernate
+        exit 0
+    done
+}
+
+case ${1:-} in
+start)
+    systemctl --user stop "$UNIT" 2>/dev/null
+    exec systemd-run --user --quiet --collect --unit="$UNIT" "$0" watch
+    ;;
+watch) watch ;;
+cancel) systemctl --user stop "$UNIT" 2>/dev/null; exit 0 ;;
+*) echo "usage: idle-sleep start|cancel" >&2; exit 2 ;;
+esac

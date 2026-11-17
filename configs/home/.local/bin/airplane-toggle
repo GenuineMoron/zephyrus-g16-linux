@@ -1,0 +1,8 @@
+#!/bin/sh
+# Airplane mode (Fn+F12 on the ROG keyboard): if any radio is on, turn all off;
+# otherwise turn all back on. Same rule as Windows, so Wi-Fi and Bluetooth stay in step.
+if rfkill -rno SOFT | grep -qx unblocked; then
+    rfkill block all && noctalia msg osd-show plane "Airplane mode on" >/dev/null 2>&1
+else
+    rfkill unblock all && noctalia msg osd-show plane-off "Airplane mode off" >/dev/null 2>&1
+fi

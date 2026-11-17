@@ -1,0 +1,11 @@
+#!/bin/sh
+# Local hook (not package-owned). noctalia's lock-before-suspend is OFF so a
+# quick lid close/open needs no password, but anything that HIBERNATES -
+# including the 1 h suspend-then-hibernate transition - comes back locked.
+case "$1:${SYSTEMD_SLEEP_ACTION:-$2}" in
+    pre:hibernate|pre:hybrid-sleep)
+        loginctl lock-sessions
+        sleep 2   # let noctalia draw its lock surface before the snapshot
+        ;;
+esac
+exit 0

@@ -1,0 +1,8 @@
+# SearXNG bot-detection settings. The limiter itself is off (server.limiter: false):
+# this instance only listens on 127.0.0.1.
+#
+# systemd-socket-proxyd forwards plain TCP and adds no X-Forwarded-For header, so the
+# local peer is the real client: don't treat 127.0.0.1 as a reverse proxy (the default),
+# or SearXNG logs "X-Forwarded-For nor X-Real-IP header is set" on every search.
+[botdetection]
+trusted_proxies = []

@@ -1,0 +1,8 @@
+# Add to ~/.local/state/noctalia/settings.toml, or set each key with
+# noctalia msg config-set idle.behavior.keyboard-light.<key> <TOML value>  (strings need quotes)
+[idle.behavior.keyboard-light]
+action = "custom"
+command = "~/.local/bin/kbd-light-idle off"
+enabled = true
+resume_command = "~/.local/bin/kbd-light-idle restore"
+timeout = 60

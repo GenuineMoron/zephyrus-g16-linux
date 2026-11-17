@@ -1,0 +1,10 @@
+# Noctalia idle behavior: sleep after 15 idle minutes, on battery only (2026-11-16).
+# Set with: noctalia msg config-set idle.behavior.sleep-on-battery.<key> <TOML value>
+# The script waits while audio plays or something holds a sleep block, and only
+# sleeps when unplugged (suspend-then-hibernate, like the lid).
+[idle.behavior.sleep-on-battery]
+action = "custom"
+command = "~/.local/bin/idle-sleep start"
+resume_command = "~/.local/bin/idle-sleep cancel"
+timeout = 900
+enabled = true

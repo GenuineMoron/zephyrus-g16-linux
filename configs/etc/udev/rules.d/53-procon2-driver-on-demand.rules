@@ -1,0 +1,10 @@
+# Run the Switch 2 Pro Controller driver (procon2-driver) only while the controller
+# is plugged in by USB. It used to run all the time and wake the CPU ~53 times a
+# second with no controller connected (zephyrus repo, research/36).
+# Linux 7.4 adds an in-kernel driver (hid-nintendo, CONFIG_NINTENDO_SWITCH2_USB).
+# Once CachyOS ships 7.4: remove procon2-driver and rules 50-53, then test with Steam/SDL.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="057e", ATTR{idProduct}=="2069", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="procon2-driver.service"
+# Stop it when the last such controller is unplugged.
+ACTION=="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="57e/2069/*", \
+  RUN+="/bin/sh -c 'for d in /sys/bus/usb/devices/*; do [ \"$$(cat $$d/idVendor 2>/dev/null)\" = 057e ] && [ \"$$(cat $$d/idProduct 2>/dev/null)\" = 2069 ] && exit 0; done; /usr/bin/systemctl --no-block stop procon2-driver.service'"

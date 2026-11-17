@@ -1,0 +1,11 @@
+[Unit]
+Description=Log which process wakes the NVIDIA GPU (journalctl -t gpu-wake)
+
+[Service]
+ExecStart=/usr/local/sbin/gpu-wake-log
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

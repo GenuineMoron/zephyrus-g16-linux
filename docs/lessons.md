@@ -1,0 +1,11 @@
+# Lessons (traps we fell into)
+
+- **The Intel TCO watchdog cannot reset this laptop.** The BIOS sets `TCO_LOCK` (TCO1_CNT bit 12) and `TCO_EN` in `SMI_EN`. The first timeout goes to an SMI handler that swallows it. On Cannon Lake and newer, `i2c-i801` gives `iTCO_wdt` no SMI resource, so `turn_SMI_watchdog_clear_off` can't help either. Unattended hang recovery has to come from the kernel itself (panic → reboot).
+- **The hung-task detector is switched off during hibernation.** It has a PM notifier that disables it, so D-state hangs in hibernation never panic. That is why [hibtrace](../tools/hibtrace/) has its own watchdog.
+- **`tracepoint_printk` can't be enabled at runtime** unless `tp_printk` was on the kernel command line, because the iterator is never allocated. kprobe events will not reach the console without it.
+- **CET IBT forbids indirect calls to "sealed" kernel functions.** Calling a non-exported function such as `kmsg_dump_desc` through an address looked up with a kprobe oopses with `Missing ENDBR`. The module is then stuck in "coming" state until reboot.
+- **Never write the RTC from a debug module.** Encoding a step number in the CMOS year looked safe because the years were "in the past" (2001–2019). But the kernel adds 100 to two-digit years below 70 *on top of* the firmware century byte. On resume the clock jumped to **2115**, and timers ran: snapper took a snapshot dated 2115 and the backup tried to run. The kernel's own `pm_trace` avoids this by marking the RTC as unusable.
+- **The pstore filesystem does not show records written by the hibernating kernel** after the image is restored. Read them from efivarfs directly.
+- **`lspci` and reading `/sys/class/drm/card*-*/status` wake a D3cold NVIDIA GPU.** Inventory and monitoring scripts must use cached values only.
+- **zsh does not word-split `$var` (bash does).** Passing `$cfg` where `cfg="lzo default"` sends one argument, which shifted every parameter in a test script. The result was a 180 GiB memory fill, which triggered [finding 04](findings/04-shell-killed-by-oom.md).
+- **`dmesg -T` and `journalctl --since` mislead after a clock jump or hibernation.** Prefer the monotonic dmesg offsets, or a journal cursor.

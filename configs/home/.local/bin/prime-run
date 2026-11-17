@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run a program on the RTX 4070 (PRIME render offload). Same as /usr/bin/prime-run,
+# plus NVIDIA's EGL driver: the session limits EGL to Mesa
+# (~/.config/environment.d/55-egl-mesa-default.conf) so apps never wake the
+# sleeping NVIDIA GPU by accident. Without this line, Wayland/EGL programs
+# (Blender, OBS, SDL3 games) would silently stay on the Intel GPU.
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __VK_LAYER_NV_optimus=NVIDIA_only
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json:/usr/share/glvnd/egl_vendor.d/50_mesa.json
+exec "$@"
