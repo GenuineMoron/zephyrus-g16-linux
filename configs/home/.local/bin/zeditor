@@ -1,0 +1,7 @@
+#!/bin/sh
+# Zed renders with Vulkan. Creating a Vulkan instance with NVIDIA's driver
+# visible wakes the sleeping RTX 4070 (~2 s, finding 05), so Zed loads only
+# Intel's Vulkan driver. Games are unaffected: this applies to Zed alone.
+: "${VK_DRIVER_FILES:=/usr/share/vulkan/icd.d/intel_icd.json}"
+export VK_DRIVER_FILES
+exec /usr/bin/zeditor "$@"
