@@ -46,6 +46,12 @@ An earlier version of this fix hid NVIDIA's Vulkan ICD from the whole session. T
 | `vulkaninfo` with no wrapper | sees the Intel GPU (integrated) and the RTX 4070 (discrete), so games pick the RTX 4070 |
 | Waking the GPU with `vulkaninfo` | logged: `apps holding it open: vulkaninfo(…)` |
 
+## WebKitGTK apps (2026-11-17)
+
+Apostrophe woke the GPU (~20 s awake) each time its preview opened; it stayed asleep with the preview off. A uprobe on libdrm's mode-setting calls, reading the return address from the stack, showed the caller: `libwebkitgtk-6.0` itself, in the app's own process, calling `drmModeGetResources`, `drmModeGetConnector` (8 times) and `drmModeGetEncoder`. This is WebKit's DRM vblank monitor: it opens each DRM card and reads its connectors to find the screen's refresh timing. On the NVIDIA card that query goes `nvidia-drm` → `nvRmGetConnectedDpys` → `nvDpyGetDynamicData` → runtime resume.
+
+`WEBKIT_WEB_RENDER_DEVICE_FILE`, `WEBKIT_DISABLE_DMABUF_RENDERER` and `WEBKIT_DMABUF_RENDERER_DISABLE_GBM` did not help. `WEBKIT_FORCE_VBLANK_TIMER=1` did: 0 wakes with the preview open. It is set for the session in [52-webkit-vblank-timer.conf](../../configs/home/.config/environment.d/52-webkit-vblank-timer.conf), so it covers every WebKitGTK view.
+
 ## Notes
 
 - **The GPU is available on battery too.** The laptop stays in Hybrid mode (asusd; supergfxctl is retired); Integrated was rejected so heavy apps keep the GPU everywhere.

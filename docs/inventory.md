@@ -91,7 +91,7 @@ Not installed, ready for upstream: `upstream/0001-intel-pmc-hw-sleep-u32-truncat
   - MRU window switcher;
   - idle `keyboard-light`.
 - `~/.local/share/applications/zen.desktop` override: Zen sees only Mesa EGL and the Intel DRM device. Its media process had been opening the RTX 4070.
-- **Editors (2026-11-17):** Zed (`zed`, text and code) and Scribe (`scribe-bin` from the AUR, a native GTK 4 Markdown editor that renders as you type). Markdown opens in Scribe; plain text and code in Zed. Zed draws with Vulkan, so `~/.local/bin/zeditor` and the `dev.zed.Zed.desktop` override load only Intel's Vulkan driver (`VK_DRIVER_FILES`); otherwise each launch would wake the RTX 4070. `~/.config/zed/settings.json`: desktop fonts, follows light/dark, telemetry off.
+- **Editors (2026-11-17):** Apostrophe (Markdown, with preview) and GNOME Text Editor (text and code, syntax highlighting; Geist Mono 11, line numbers, 4-space indents). Markdown opens in Apostrophe; plain text and code in Text Editor. `~/.config/environment.d/52-webkit-vblank-timer.conf` sets `WEBKIT_FORCE_VBLANK_TIMER=1`: otherwise WebKitGTK (Apostrophe's preview) reads the NVIDIA card's connectors and wakes the RTX 4070 ([05](findings/05-apps-wake-nvidia-gpu.md)).
 - **Umbriel** (the only session since 2026-11-15; niri, used before, is retired):
   - `~/.config/umbriel/config.toml`: Intel-only (the NVIDIA card stays asleep; HDMI and the NVIDIA USB-C port can't drive a monitor), 240 Hz, HDR auto, VRR off (umbriel#809), factory ICC, no blur, keybinds, Num Lock left off;
   - `~/.config/systemd/user/umbriel.service.d/10-intel-only-egl.conf`: the compositor itself uses Mesa EGL only;
