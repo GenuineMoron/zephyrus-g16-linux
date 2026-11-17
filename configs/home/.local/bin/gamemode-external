@@ -12,6 +12,13 @@ if [ -n "${SteamAppId:-}" ] && [ -r "$HOME/.config/game-env/$SteamAppId.env" ]; 
     . "$HOME/.config/game-env/$SteamAppId.env"
     set +a
 fi
+# Tell the gamemode profile hook which profile this game wants (see gamemode-profile).
+HINT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gamemode-profile.hint
+if [ -n "${GAME_PROFILE:-}" ]; then
+    printf '%s %s\n' "$GAME_PROFILE" "${GAME_BALANCED_EPP:-}" > "$HINT"
+else
+    rm -f "$HINT"
+fi
 
 "$@" &
 pid=$!
