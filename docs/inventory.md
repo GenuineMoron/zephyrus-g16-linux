@@ -91,7 +91,7 @@ Not installed, ready for upstream: `upstream/0001-intel-pmc-hw-sleep-u32-truncat
   - MRU window switcher;
   - idle `keyboard-light`.
 - `~/.local/share/applications/zen.desktop` override: Zen sees only Mesa EGL and the Intel DRM device. Its media process had been opening the RTX 4070.
-- **Editors (2026-11-17):** Apostrophe (Markdown, with preview) and GNOME Text Editor (text and code, syntax highlighting; Geist Mono 11, line numbers, 4-space indents). Markdown opens in Apostrophe; plain text and code in Text Editor. `~/.config/environment.d/52-webkit-vblank-timer.conf` sets `WEBKIT_FORCE_VBLANK_TIMER=1`: otherwise WebKitGTK (Apostrophe's preview) reads the NVIDIA card's connectors and wakes the RTX 4070 ([05](findings/05-apps-wake-nvidia-gpu.md)).
+- **Editors (2026-11-17):** Quiet.md (Markdown and notes; AppImage v0.1.13 in `~/.local/share/quiet-md`, checksum and minisign signature verified, self-updating; its launcher sets `VK_DRIVER_FILES` to Intel's Vulkan driver so the RTX 4070 stays asleep) and GNOME Text Editor (text and code; Geist Mono 11, line numbers, 4-space indents). `~/.config/environment.d/52-webkit-vblank-timer.conf` keeps any WebKitGTK view from waking the RTX 4070 ([05](findings/05-apps-wake-nvidia-gpu.md)).
 - **Umbriel** (the only session since 2026-11-15; niri, used before, is retired):
   - `~/.config/umbriel/config.toml`: Intel-only (the NVIDIA card stays asleep; HDMI and the NVIDIA USB-C port can't drive a monitor), 240 Hz, HDR auto, VRR off (umbriel#809), factory ICC, no blur, keybinds, Num Lock left off;
   - `~/.config/systemd/user/umbriel.service.d/10-intel-only-egl.conf`: the compositor itself uses Mesa EGL only;

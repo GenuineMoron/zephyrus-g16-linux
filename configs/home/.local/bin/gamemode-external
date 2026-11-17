@@ -1,0 +1,28 @@
+#!/bin/sh
+# gamemoderun's LD_PRELOAD (libgamemodeauto.so) gets caught by EasyAntiCheat's
+# anti-tamper checks and kills the game (confirmed: Elden Ring crashed on launch
+# with gamemoderun alone in the launch options, worked with no launch options).
+# GameMode's D-Bus API lets an external process register a PID for the same
+# Performance-profile switch (see ~/.config/gamemode.ini) without injecting
+# anything into the game's own address space.
+# Per-game environment, so launch tweaks need no Steam edits:
+# ~/.config/game-env/<SteamAppId>.env holds KEY=value lines (blank and # lines ignored).
+if [ -n "${SteamAppId:-}" ] && [ -r "$HOME/.config/game-env/$SteamAppId.env" ]; then
+    set -a
+    . "$HOME/.config/game-env/$SteamAppId.env"
+    set +a
+fi
+
+"$@" &
+pid=$!
+gdbus call --session \
+  --dest com.feralinteractive.GameMode \
+  --object-path /com/feralinteractive/GameMode \
+  --method com.feralinteractive.GameMode.RegisterGame "$pid" >/dev/null 2>&1
+wait "$pid"
+status=$?
+gdbus call --session \
+  --dest com.feralinteractive.GameMode \
+  --object-path /com/feralinteractive/GameMode \
+  --method com.feralinteractive.GameMode.UnregisterGame "$pid" >/dev/null 2>&1
+exit "$status"
