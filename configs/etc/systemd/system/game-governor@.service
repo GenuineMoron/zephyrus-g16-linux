@@ -1,7 +1,0 @@
-[Unit]
-Description=Game governor: frame target with the least power it needs (user %i)
-Documentation=file:///usr/local/sbin/game-governor
-
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/game-governor %i

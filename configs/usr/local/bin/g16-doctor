@@ -166,10 +166,10 @@ check_booted() {
     done < <(systemctl list-units --type=timer --state=active --plain --no-legend 2>/dev/null)
     (( ${#dead[@]} == 0 )) || fail "Timers that will never run: ${dead[*]}"
 
-    # Game power governor: its path unit must be armed, or games run without it.
+    # Game power governor: always on, or games run without frame-target power management.
     if [[ -x /usr/local/sbin/game-governor ]]; then
-        systemctl list-units --type=path --state=active --plain --no-legend 2>/dev/null | grep -q '^game-governor@' \
-            || fail "The game power governor isn't armed (game-governor@<uid>.path inactive), so games won't get frame-target power management."
+        systemctl is-active --quiet game-governor.service \
+            || fail "The game power governor (game-governor.service) isn't running, so games won't get frame-target power management."
     fi
 
     journalctl -k -b -q -g 'NVRM: Xid' --no-pager 2>/dev/null | grep -q . \

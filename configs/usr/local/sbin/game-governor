@@ -1,30 +1,33 @@
 #!/usr/bin/python3 -I
-"""game-governor: keep a game at its frame target with as little power as it needs.
+"""game-governor: every Proton game at its frame target, with as little power as it needs.
 
-Started by game-governor@<uid>.path when gamemode-external writes
-/run/user/<uid>/game-governor.env (APPID, TARGET_AC, TARGET_BATTERY); exits when
-that file is removed, which gamemode-external does as the game ends, before
-GameMode's end hook restores the normal profile.
+An always-on system service (game-governor.service). It needs no launch options:
+it notices a game the moment it starts presenting frames (a kernel uprobe event on
+the vkQueuePresentKHR thunk in every installed Proton's winevulkan.so, in a private
+ftrace instance; idle, it blocks on trace_pipe and wakes once a minute to notice
+Proton updates), and ends the session when the game's process exits.
 
-Two states:
-  efficient  Balanced profile (quieter fans); the gamemode start hook has set
-             Balanced's CPU EPP to balance_performance for the session.
-  boost      Performance profile (more GPU power, more fan).
+Per game (optional) and default settings, read from the user's
+~/.config/game-env/<appid>.env and default.env (KEY=value; only these keys):
+  GAME_FPS_TARGET_AC / GAME_FPS_TARGET_BATTERY   frame target (default 120 / 60)
+  GAME_GOVERNOR       auto (default) | fixed | off
+  GAME_PROFILE        Balanced | Performance | Quiet   (fixed mode)
+  GAME_BALANCED_EPP   asusd EPP for Balanced during the session (default 2 =
+                      balance_performance; 1 performance, 3 balance_power, 4 power)
+  GAME_CPU_MAX_MHZ    cap the CPU's top boost while efficient (default: none)
 
-Rules, all measured on the game's own frame rate (presents per second, counted
-with a bpftrace uprobe on Proton's winevulkan vkQueuePresentKHR thunk):
-  - efficient -> boost when the game misses its target for 10 s (on AC only).
-    Boost must prove itself: if after 30 s the frame rate did not improve by
-    5 % (or reach the target), go back and treat the frame rate it had as the
-    game's own cap for 5 minutes (then 10, 20, ... if it happens again).
+auto mode, all decisions measured on the game's own frame rate:
+  - start efficient: Balanced fans, CPU at GAME_BALANCED_EPP.
+  - efficient -> boost (Performance) when the target is missed for 10 s, on AC
+    only. Boost must prove itself: if after 30 s fps did not rise 5 % (or reach
+    the target), go back and treat that frame rate as the game's own cap for
+    5, then 10, 20 ... minutes.
   - boost -> efficient after 3 minutes at the target with the GPU at most 75 %
-    busy. If the target is then missed within 30 s, back to boost and wait
-    twice as long before trying again.
-  - No frame signal (native game, or the probe failed): Performance for the
-    session. Never throttle without measuring.
-  - Optional CPU_MAX_MHZ caps the CPU's top boost while efficient (lifted in
-    boost, always restored at exit). Off unless a game's settings ask for it.
-Every decision is logged (journalctl -u 'game-governor@*').
+    busy; if the target is then missed, back to boost and wait twice as long.
+  - at the end: Balanced's EPP and asusd's profile for the current power source
+    are restored. A crash is repaired at the next start.
+Never throttles blind: if the frame probe can't run, games get no changes.
+Log: journalctl -u game-governor. Live state: /run/game-governor/status.
 """
 import glob
 import os
@@ -33,275 +36,474 @@ import re
 import select
 import signal
 import subprocess
-import sys
 import time
 
-UID = int(sys.argv[1])
-HOME = pwd.getpwuid(UID).pw_dir
-RUN = f"/run/user/{UID}"
-CFG = f"{RUN}/game-governor.env"
-STATUS = f"{RUN}/game-governor.status"
+STATE_DIR = "/run/game-governor"
+TRACE = "/sys/kernel/tracing"
+INSTANCE = f"{TRACE}/instances/gamegov"
+SAVED = f"{STATE_DIR}/saved"
+STATUS = f"{STATE_DIR}/status"
 GPU = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
-PROFILES = {"Balanced": 0, "Performance": 1}
+ASUSD = ["xyz.ljones.Asusd", "/xyz/ljones", "xyz.ljones.Platform"]
+PROFILE_NUM = {"Balanced": 0, "Performance": 1, "Quiet": 2}
 
-ESCALATE_AFTER = 10      # s below target in efficient
-ESCALATE_BELOW = 0.93    # fraction of target
-VALIDATE = 30            # s to judge a switch
-GAIN_NEEDED = 1.05       # boost must raise fps by 5 % (or reach the target)
-LEARNED_CAP_HOLD = 300   # s before retrying boost after it did not help
-DEESCALATE_AFTER = 180   # s at target with GPU headroom in boost
-DEESCALATE_GPU = 75      # % GPU busy at most to try efficient
-MIN_DWELL = 30           # s between switches
-ACTIVE_FPS = 10          # below this: menus, loading, paused
+START_FPS = 20           # presents/s for START_SECS in a row = a game is running
+START_SECS = 3
+ESCALATE_AFTER = 10
+ESCALATE_BELOW = 0.93
+VALIDATE = 30
+GAIN_NEEDED = 1.05
+LEARNED_CAP_HOLD = 300
+DEESCALATE_AFTER = 180
+DEESCALATE_GPU = 75
+MIN_DWELL = 30
+ACTIVE_FPS = 10
+KEYS = {"GAME_FPS_TARGET_AC": r"\d{1,4}", "GAME_FPS_TARGET_BATTERY": r"\d{1,4}",
+        "GAME_GOVERNOR": r"auto|fixed|off", "GAME_PROFILE": r"Balanced|Performance|Quiet",
+        "GAME_BALANCED_EPP": r"[1-4]", "GAME_CPU_MAX_MHZ": r"\d{3,5}"}
 
 
 def log(msg):
     print(msg, flush=True)
 
 
-def read_cfg():
+def read(path, default=None):
     try:
-        text = open(CFG).read()
+        with open(path) as f:
+            return f.read().strip()
     except OSError:
-        return None
-    cfg = {}
-    for line in text.splitlines():
-        m = re.fullmatch(r"(APPID|TARGET_AC|TARGET_BATTERY|CPU_MAX_MHZ)=(\d{1,7})", line.strip())
-        if m:
-            cfg[m.group(1)] = int(m.group(2))
-    return cfg
+        return default
+
+
+def busctl_get(prop):
+    out = subprocess.run(["busctl", "--system", "get-property", *ASUSD, prop],
+                         capture_output=True, text=True, timeout=5).stdout.split()
+    return int(out[1]) if len(out) == 2 and out[1].isdigit() else None
+
+
+def busctl_set(prop, value):
+    subprocess.run(["busctl", "--system", "set-property", *ASUSD, prop, "u", str(value)],
+                   capture_output=True, timeout=5)
+
+
+def set_profile(name):
+    busctl_set("PlatformProfile", PROFILE_NUM[name])
 
 
 def on_ac():
     for d in glob.glob("/sys/class/power_supply/*"):
-        try:
-            if open(f"{d}/type").read().strip() == "Mains":
-                return open(f"{d}/online").read().strip() == "1"
-        except OSError:
-            pass
+        if read(f"{d}/type") == "Mains":
+            return read(f"{d}/online") == "1"
     return True
 
 
-def current_profile():
-    try:
-        return open("/sys/firmware/acpi/platform_profile").read().strip()
-    except OSError:
-        return "?"
-
-
-def set_profile(name):
-    subprocess.run(["busctl", "--system", "set-property", "xyz.ljones.Asusd", "/xyz/ljones",
-                    "xyz.ljones.Platform", "PlatformProfile", "u", str(PROFILES[name])],
-                   capture_output=True, timeout=5)
-
-
 def cpu_cap(mhz):
-    """Cap every CPU's top frequency (efficient state only); None restores the hardware maximum."""
+    """Cap every CPU's top frequency; None restores the hardware maximum."""
     for d in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq"):
         try:
-            hw = int(open(f"{d}/cpuinfo_max_freq").read())
-            khz = hw if mhz is None else max(int(open(f"{d}/cpuinfo_min_freq").read()), min(hw, mhz * 1000))
+            hw = int(read(f"{d}/cpuinfo_max_freq"))
+            khz = hw if mhz is None else max(int(read(f"{d}/cpuinfo_min_freq")), min(hw, mhz * 1000))
             with open(f"{d}/scaling_max_freq", "w") as f:
                 f.write(str(khz))
-        except (OSError, ValueError):
+        except (OSError, TypeError, ValueError):
             pass
 
 
 def gpu_busy():
     """GPU utilisation in %, or None. Only asks the driver while the GPU is awake."""
+    if read(GPU) != "active":
+        return None
     try:
-        if open(GPU).read().strip() != "active":
-            return None
-        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
-                              "--format=csv,noheader,nounits"],
+        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=5).stdout
         return int(out.split()[0])
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+    except (ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def home_dirs():
+    return [p.pw_dir for p in pwd.getpwall() if p.pw_uid >= 1000 and p.pw_dir.startswith("/home/")]
+
+
+def lib_paths():
+    pats = ["/usr/share/steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so"]
+    for h in home_dirs():
+        pats += [f"{h}/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so",
+                 f"{h}/.local/share/Steam/steamapps/common/Proton*/files/lib/wine/x86_64-unix/winevulkan.so",
+                 f"{h}/.local/share/umu/*/files/lib/wine/x86_64-unix/winevulkan.so"]
+    return sorted({p for pat in pats for p in glob.glob(pat)})
+
+
+def lib_signature():
+    """Cheap check for Proton installs and updates: path, inode and mtime only."""
+    sig = {}
+    for lib in lib_paths():
+        try:
+            st = os.stat(lib)
+            sig[lib] = (st.st_ino, st.st_mtime)
+        except OSError:
+            pass
+    return sig
 
 
 def probe_libs():
-    pats = ["/usr/share/steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so",
-            f"{HOME}/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so",
-            f"{HOME}/.local/share/Steam/steamapps/common/Proton*/files/lib/wine/x86_64-unix/winevulkan.so"]
-    probes = []
-    for lib in sorted({p for pat in pats for p in glob.glob(pat)}):
+    found = {}
+    for lib in lib_paths():
+        try:
+            st = os.stat(lib)
+        except OSError:
+            continue
         syms = subprocess.run(["nm", "--defined-only", lib], capture_output=True, text=True).stdout
-        for sym in ("thunk64_vkQueuePresentKHR", "thunk32_vkQueuePresentKHR"):
-            if re.search(rf" {sym}$", syms, re.M):
-                probes.append(f'uprobe:"{lib}":{sym}')
-    return probes
+        names = [s for s in ("thunk64_vkQueuePresentKHR", "thunk32_vkQueuePresentKHR")
+                 if re.search(rf" {s}$", syms, re.M)]
+        if names:
+            found[lib] = (st.st_ino, st.st_mtime, tuple(names))
+    return found
 
 
-def start_probe():
-    probes = probe_libs()
-    if not probes:
+def file_offset(lib, sym):
+    """File offset of a symbol (what uprobe_events wants), from its address and the PT_LOAD headers."""
+    addr = None
+    for line in subprocess.run(["nm", "--defined-only", lib], capture_output=True, text=True).stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] == sym:
+            addr = int(parts[0], 16)
+    if addr is None:
         return None
-    prog = ", ".join(probes) + " { @n = @n + 1; } interval:s:1 { printf(\"%d\\n\", @n); @n = 0; }"
-    return subprocess.Popen(["bpftrace", "-B", "line", "-q", "-e", prog],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    for line in subprocess.run(["readelf", "-lW", lib], capture_output=True, text=True).stdout.splitlines():
+        f = line.split()
+        if f and f[0] == "LOAD":
+            off, vaddr, filesz = int(f[1], 16), int(f[2], 16), int(f[4], 16)
+            if vaddr <= addr < vaddr + filesz:
+                return addr - vaddr + off
+    return None
 
 
-class Governor:
-    def __init__(self, cfg):
-        self.cfg = cfg
+def tracefs_append(text):
+    """Append to a tracefs control file. Python's "a" mode seeks, which tracefs rejects."""
+    fd = os.open(f"{TRACE}/uprobe_events", os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+class Probe:
+    """uprobe events on the present thunks, read from a private ftrace instance's trace_pipe."""
+
+    def __init__(self, libs):
+        self.events, self.fd = [], None
+        os.makedirs(f"{STATE_DIR}/libs", exist_ok=True)
+        defs = []
+        for i, (lib, (_, _, syms)) in enumerate(libs.items()):
+            link = f"{STATE_DIR}/libs/{i}.so"  # uprobe_events can't take paths with spaces
+            try:
+                os.remove(link)
+            except OSError:
+                pass
+            os.symlink(lib, link)
+            for sym in syms:
+                off = file_offset(lib, sym)
+                if off is not None:
+                    name = f"gamegov/present{len(self.events)}"
+                    defs.append(f"p:{name} {link}:{off:#x}")
+                    self.events.append(name)
+        if not self.events:
+            return
+        self.teardown_events()
+        for d in defs:
+            tracefs_append(d + "\n")
+        os.makedirs(INSTANCE, exist_ok=True)
+        for name in self.events:
+            with open(f"{INSTANCE}/events/{name}/enable", "w") as f:
+                f.write("1")
+        self.fd = os.open(f"{INSTANCE}/trace_pipe", os.O_RDONLY | os.O_NONBLOCK)
+        self.buf = b""
+
+    def read_pids(self):
+        """pids of the presents that arrived; [] if none."""
+        try:
+            data = os.read(self.fd, 65536)
+        except BlockingIOError:
+            return []
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        pids = []
+        for line in lines:
+            m = re.match(rb"\s*.*?-(\d+)\s+\[\d+\]", line)
+            if m:
+                pids.append(int(m.group(1)))
+        return pids
+
+    def teardown_events(self):
+        try:
+            with open(f"{TRACE}/uprobe_events") as f:
+                ours = [l.split()[0][2:] for l in f if l.startswith("p:gamegov/")]
+        except OSError:
+            ours = []
+        for name in ours:
+            try:
+                with open(f"{INSTANCE}/events/{name}/enable", "w") as f:
+                    f.write("0")
+            except OSError:
+                pass
+        try:
+            os.rmdir(INSTANCE)
+        except OSError:
+            pass
+        for name in ours:
+            try:
+                tracefs_append(f"-:{name}\n")
+            except OSError:
+                pass
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        self.teardown_events()
+
+
+def start_probe(libs):
+    if not libs:
+        return None
+    probe = Probe(libs)
+    return probe if probe.fd is not None else None
+
+
+def game_settings(pid):
+    """Settings for the game in pid: (appid or exe name, settings dict)."""
+    env = {}
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for item in f.read().split(b"\0"):
+                k, _, v = item.partition(b"=")
+                env[k.decode(errors="replace")] = v.decode(errors="replace")
+        owner = pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_dir
+    except (OSError, KeyError):
+        return None, {}
+    appid = env.get("SteamAppId") or env.get("STEAM_COMPAT_APP_ID") or env.get("SteamGameId") or ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", appid):
+        appid = ""
+    name = appid or read(f"/proc/{pid}/comm", "game")
+    settings = {}
+    for f in ("default", appid):
+        if not f:
+            continue
+        text = read(f"{owner}/.config/game-env/{f}.env", "")
+        for line in text.splitlines():
+            m = re.fullmatch(r"(GAME_[A-Z_]+)=(\S+)", line.strip())
+            if m and m.group(1) in KEYS and re.fullmatch(KEYS[m.group(1)], m.group(2)):
+                settings[m.group(1)] = m.group(2)
+    return name, settings
+
+
+class Session:
+    def __init__(self, pid, name, s):
+        self.pid, self.name, self.s = pid, name, s
+        self.mode = s.get("GAME_GOVERNOR", "auto")
         self.state = "efficient"
         self.since = time.monotonic()
-        self.fps = []            # per-second presents, newest last
-        self.gpu = []            # GPU busy samples
-        self.pending = None      # ("escalate", fps_before) or ("deescalate", None)
-        self.learned_cap = None  # (fps, until)
+        self.fps, self.gpu = [], []
+        self.pending = None
+        self.learned_cap = None
         self.cap_hold = LEARNED_CAP_HOLD
         self.boost_hold = DEESCALATE_AFTER
         self.seconds = {"efficient": 0, "boost": 0}
         self.frames = 0
+        self.cpu_mhz = int(s["GAME_CPU_MAX_MHZ"]) if "GAME_CPU_MAX_MHZ" in s else None
 
     def target(self):
-        t = self.cfg.get("TARGET_AC" if on_ac() else "TARGET_BATTERY", 60)
+        t = int(self.s.get("GAME_FPS_TARGET_AC" if on_ac() else "GAME_FPS_TARGET_BATTERY",
+                           120 if on_ac() else 60))
         if self.learned_cap and time.monotonic() < self.learned_cap[1]:
             t = min(t, self.learned_cap[0])
         return t
 
-    def avg(self, seconds):
-        s = self.fps[-seconds:]
+    def avg(self, n):
+        s = self.fps[-n:]
         return sum(s) / len(s) if s else 0.0
 
+    def begin(self):
+        if self.mode == "off":
+            log(f"{self.name}: governor off for this game")
+            return
+        saved = busctl_get("ProfileBalancedEpp")
+        if saved is not None and not os.path.exists(SAVED):
+            with open(SAVED, "w") as f:
+                f.write(str(saved))
+        busctl_set("ProfileBalancedEpp", int(self.s.get("GAME_BALANCED_EPP", 2)))
+        profile = self.s.get("GAME_PROFILE", "Performance") if self.mode == "fixed" else "Balanced"
+        set_profile(profile)
+        if self.cpu_mhz and self.mode == "auto":
+            cpu_cap(self.cpu_mhz)
+        log(f"{self.name}: started (pid {self.pid}), {self.mode}, {profile}, target "
+            f"{self.s.get('GAME_FPS_TARGET_AC', 120)} fps on AC / {self.s.get('GAME_FPS_TARGET_BATTERY', 60)} on battery"
+            + (f", CPU capped at {self.cpu_mhz} MHz while efficient" if self.cpu_mhz else ""))
+
     def switch(self, state, why):
-        self.state = state
-        self.since = time.monotonic()
+        self.state, self.since = state, time.monotonic()
         set_profile("Performance" if state == "boost" else "Balanced")
-        if self.cfg.get("CPU_MAX_MHZ"):
-            cpu_cap(None if state == "boost" else self.cfg["CPU_MAX_MHZ"])
-        log(f"{state}: {why}")
+        if self.cpu_mhz:
+            cpu_cap(None if state == "boost" else self.cpu_mhz)
+        log(f"{self.name}: {state}: {why}")
 
     def tick(self, fps, gpu):
+        if self.mode != "auto":
+            return
         now = time.monotonic()
-        self.fps.append(fps)
-        self.fps = self.fps[-600:]
+        self.fps = (self.fps + [fps])[-600:]
         if gpu is not None:
-            self.gpu.append(gpu)
-            self.gpu = self.gpu[-300:]
+            self.gpu = (self.gpu + [gpu])[-300:]
         self.seconds[self.state] += 1
         self.frames += fps
-        target = self.target()
-        dwell = now - self.since
+        target, dwell = self.target(), now - self.since
 
         if not on_ac():
             if self.state == "boost":
                 self.pending = None
                 self.switch("efficient", "on battery")
-            elif current_profile() != "balanced":
+            elif read("/sys/firmware/acpi/platform_profile") != "balanced":
                 set_profile("Balanced")
             return
-
         if self.pending and dwell >= VALIDATE:
             kind, before = self.pending
             self.pending = None
             after = self.avg(20)
             if kind == "escalate":
                 if after >= before * GAIN_NEEDED or after >= target * 0.97:
-                    log(f"boost kept: {before:.0f} -> {after:.0f} fps (target {target})")
+                    log(f"{self.name}: boost kept: {before:.0f} -> {after:.0f} fps (target {target})")
                 else:
                     self.learned_cap = (max(ACTIVE_FPS, round(before * 1.03)), now + self.cap_hold)
-                    self.switch("efficient", f"boost did not help ({before:.0f} -> {after:.0f} fps); "
-                                f"treating ~{before:.0f} fps as the game's cap for {self.cap_hold // 60} min")
+                    self.switch("efficient", f"boost did not help ({before:.0f} -> {after:.0f} fps); treating "
+                                f"~{before:.0f} fps as the game's cap for {self.cap_hold // 60} min")
                     self.cap_hold *= 2
+            elif after < target * 0.95:
+                self.boost_hold *= 2
+                self.switch("boost", f"efficient missed the target ({after:.0f} < {target} fps); "
+                            f"next try in {self.boost_hold // 60} min")
             else:
-                if after < target * 0.95:
-                    self.boost_hold *= 2
-                    self.switch("boost", f"efficient missed the target ({after:.0f} < {target} fps); "
-                                f"next try in {self.boost_hold // 60} min")
-                else:
-                    self.boost_hold = DEESCALATE_AFTER
-                    log(f"efficient kept: {after:.0f} fps at target {target}")
+                self.boost_hold = DEESCALATE_AFTER
+                log(f"{self.name}: efficient kept: {after:.0f} fps at target {target}")
             return
         if self.pending or dwell < MIN_DWELL:
             return
-
-        recent = self.fps[-ESCALATE_AFTER:]
         if self.state == "efficient":
-            if (len(recent) == ESCALATE_AFTER and all(ACTIVE_FPS <= f < target * ESCALATE_BELOW for f in recent)):
+            recent = self.fps[-ESCALATE_AFTER:]
+            if len(recent) == ESCALATE_AFTER and all(ACTIVE_FPS <= f < target * ESCALATE_BELOW for f in recent):
                 before = self.avg(ESCALATE_AFTER)
                 self.pending = ("escalate", before)
                 self.switch("boost", f"{before:.0f} fps below target {target} for {ESCALATE_AFTER} s; trying Performance")
         else:
-            window = self.fps[-self.boost_hold:]
-            gpu = self.gpu[-self.boost_hold // 2:]
+            window, gpu = self.fps[-self.boost_hold:], self.gpu[-(self.boost_hold // 2):]
             if (dwell >= self.boost_hold and len(window) >= self.boost_hold and min(window) >= ACTIVE_FPS
                     and sum(window) / len(window) >= target * 0.98 and gpu and max(gpu) <= DEESCALATE_GPU):
                 self.pending = ("deescalate", None)
-                self.switch("efficient", f"{self.boost_hold // 60} min at target {target} with the GPU "
-                            f"at most {max(gpu)} % busy; trying Balanced")
+                self.switch("efficient", f"{self.boost_hold // 60} min at target {target} with the GPU at most "
+                            f"{max(gpu)} % busy; trying Balanced")
+
+    def end(self):
+        if self.mode != "off":
+            restore()
+        total = self.seconds["efficient"] + self.seconds["boost"]
+        summary = f"{self.name}: ended"
+        if total:
+            summary += (f" after {total // 60} min: avg {self.frames / total:.0f} fps, "
+                        f"Performance {100 * self.seconds['boost'] // total} % of the time")
+            if self.seconds["boost"] > 0.2 * total:
+                summary += " (often needed Performance: a lower graphics setting would make it quieter)"
+        log(summary)
+
+
+def restore():
+    """Balanced's EPP back to what it was, the CPU uncapped, asusd's profile for this power source."""
+    saved = read(SAVED)
+    if saved and saved.isdigit():
+        busctl_set("ProfileBalancedEpp", int(saved))
+    try:
+        os.remove(SAVED)
+    except OSError:
+        pass
+    cpu_cap(None)
+    default = busctl_get("PlatformProfileOnAc" if on_ac() else "PlatformProfileOnBattery")
+    if default is not None:
+        busctl_set("PlatformProfile", default)
 
 
 def write_status(text):
-    tmp = STATUS + ".tmp"
-    with open(tmp, "w") as f:
+    with open(STATUS + ".tmp", "w") as f:
         f.write(text + "\n")
-    os.chown(tmp, UID, -1)
-    os.replace(tmp, STATUS)
+    os.replace(STATUS + ".tmp", STATUS)
 
 
 def main():
-    cfg = read_cfg()
-    if cfg is None:
-        return
-    probe = start_probe()
-    gov = Governor(cfg)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(SAVED):
+        log("restoring settings left by an interrupted session")
+        restore()
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
-    log(f"start: app {cfg.get('APPID')}, target {cfg.get('TARGET_AC')} fps on AC / "
-        f"{cfg.get('TARGET_BATTERY')} on battery, probe {'on' if probe else 'unavailable'}")
-    fallback = probe is None
-    if cfg.get("CPU_MAX_MHZ") and not fallback:
-        cpu_cap(cfg["CPU_MAX_MHZ"])
-        log(f"CPU capped at {cfg['CPU_MAX_MHZ']} MHz while efficient")
-    if fallback:
-        set_profile("Performance")
-        log("no frame signal: Performance for this session (never throttle blind)")
-    started = time.monotonic()
-    seen_frames = False
-    tick = 0
+    libs = probe_libs()
+    signature = lib_signature()
+    probe = start_probe(libs)
+    log(f"watching {len(libs)} Proton build(s) for games" if probe else "no Proton winevulkan.so found; idle")
+    counts, streak, session = {}, {}, None
+    last_tick = time.monotonic()
+    last_lib_check = last_tick
     try:
-        while not stop and os.path.exists(CFG):
-            fps = None
+        while not stop:
+            timeout = 1.0 if (session or counts) else 60.0
             if probe:
-                r, _, _ = select.select([probe.stdout], [], [], 1.5)
+                r, _, _ = select.select([probe.fd], [], [], timeout)
                 if r:
-                    line = probe.stdout.readline()
-                    if not line:
-                        probe = None
-                        fallback = True
-                        set_profile("Performance")
-                        log("frame probe stopped: Performance for the rest of the session")
-                        continue
-                    fps = int(line.strip() or 0)
+                    for pid in probe.read_pids():
+                        counts[pid] = counts.get(pid, 0) + 1
             else:
-                time.sleep(1)
-            if fallback or fps is None:
-                write_status("state=performance (no frame signal)")
+                time.sleep(timeout)
+            now = time.monotonic()
+            if now - last_lib_check > 60 and not session:
+                last_lib_check = now
+                fresh_sig = lib_signature()
+                if fresh_sig != signature:
+                    signature = fresh_sig
+                    libs = probe_libs()
+                    if probe:
+                        probe.close()
+                    probe = start_probe(libs)
+                    log(f"Proton builds changed; watching {len(libs)}")
+            if now - last_tick < 1.0:
                 continue
-            if fps:
-                seen_frames = True
-            elif not seen_frames and time.monotonic() - started > 120:
-                fallback = True
-                set_profile("Performance")
-                log("no frames seen in 2 min (not a Proton Vulkan game?): Performance for this session")
-                continue
-            tick += 1
-            gpu = gpu_busy() if tick % 2 == 0 else (gov.gpu[-1] if gov.gpu else None)
-            if seen_frames:
-                gov.tick(fps, gpu)
-            write_status(f"state={gov.state} fps={fps} target={gov.target()} gpu={gpu} ac={int(on_ac())}")
+            last_tick = now
+            if session:
+                if not os.path.exists(f"/proc/{session.pid}"):
+                    session.end()
+                    session = None
+                    write_status("idle")
+                else:
+                    fps = counts.get(session.pid, 0)
+                    gpu = gpu_busy() if int(now) % 2 == 0 else (session.gpu[-1] if session.gpu else None)
+                    session.tick(fps, gpu)
+                    write_status(f"game={session.name} state={session.state} fps={fps} target={session.target()} "
+                                 f"gpu={gpu} ac={int(on_ac())}")
+            else:
+                for pid, n in counts.items():
+                    streak[pid] = streak.get(pid, 0) + 1 if n >= START_FPS else 0
+                for pid in list(streak):
+                    if pid not in counts:
+                        streak.pop(pid)
+                ready = [p for p, s in streak.items() if s >= START_SECS and os.path.exists(f"/proc/{p}")]
+                if ready:
+                    pid = max(ready, key=lambda p: counts.get(p, 0))
+                    name, settings = game_settings(pid)
+                    session = Session(pid, name or str(pid), settings)
+                    session.begin()
+                    streak.clear()
+            counts = {}
     finally:
+        if session:
+            session.end()
         if probe:
-            probe.terminate()
-        if cfg.get("CPU_MAX_MHZ"):
-            cpu_cap(None)
-        total = gov.seconds["efficient"] + gov.seconds["boost"]
-        if total:
-            log(f"end: {total // 60} min played, avg {gov.frames / total:.0f} fps, "
-                f"Performance {100 * gov.seconds['boost'] // total} % of the time")
+            probe.close()
         try:
             os.remove(STATUS)
         except OSError:

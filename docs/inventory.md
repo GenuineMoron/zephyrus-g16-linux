@@ -36,7 +36,7 @@ Built from a scan of every file in the relevant system directories that no packa
 | Power button → power menu | `~/.config/systemd/user/power-key-menu.service` + Umbriel `XF86PowerOff` binding | Holds logind's `handle-power-key` lock while Noctalia runs, so a press opens the session menu; logind's default applies at the greeter ([42](research/42-audit-2026-11-16.md)) | yes |
 | Sleep on battery when idle | `~/.local/bin/idle-sleep` + Noctalia idle behavior `sleep-on-battery` (900 s) | Suspend-then-hibernate after 15 idle minutes on battery, unless audio plays or a sleep block is held ([42](research/42-audit-2026-11-16.md)) | yes |
 | Shell auto-relock | `~/.local/bin/noctalia-relock-if-locked` + `~/.config/systemd/user/noctalia.service` | Noctalia as a restartable service that re-locks if the session was locked ([04](findings/04-shell-killed-by-oom.md)) | yes |
-| Game power | `~/.local/bin/gamemode-external` (Steam launch options) + `~/.config/game-env/*.env` + `~/.local/bin/gamemode-profile` + `/usr/local/sbin/game-governor` (`game-governor@<uid>.path`) + `tools/game-capture` | Frame target per game, efficient start, Performance only while it measurably helps ([44](research/44-game-power-governor.md)) | yes |
+| Game power | `/usr/local/sbin/game-governor` + `game-governor.service` (always on; detects Proton games by their presents) + `~/.config/game-env/*.env` + `~/.config/environment.d/57-proton-game-defaults.conf` + `tools/game-capture` | Frame target per game, efficient start, Performance only while it measurably helps; no launch wrappers ([44](research/44-game-power-governor.md)) | yes |
 
 ## 2. Patched upstream software (installed)
 

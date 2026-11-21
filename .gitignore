@@ -18,3 +18,7 @@ packaging/*/*.tar.*
 packaging/*/*.pkg.tar.*
 packaging/hid-asus-wake-dkms/hid-asus.c.cachyos-*
 packaging/hid-asus-wake-dkms/hid-ids.h
+
+# Python bytecode
+__pycache__/
+*.pyc
