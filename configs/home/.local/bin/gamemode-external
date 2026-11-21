@@ -1,23 +1,44 @@
 #!/bin/sh
-# gamemoderun's LD_PRELOAD (libgamemodeauto.so) gets caught by EasyAntiCheat's
-# anti-tamper checks and kills the game (confirmed: Elden Ring crashed on launch
-# with gamemoderun alone in the launch options, worked with no launch options).
-# GameMode's D-Bus API lets an external process register a PID for the same
-# Performance-profile switch (see ~/.config/gamemode.ini) without injecting
-# anything into the game's own address space.
-# Per-game environment, so launch tweaks need no Steam edits:
-# ~/.config/game-env/<SteamAppId>.env holds KEY=value lines (blank and # lines ignored).
-if [ -n "${SteamAppId:-}" ] && [ -r "$HOME/.config/game-env/$SteamAppId.env" ]; then
-    set -a
-    . "$HOME/.config/game-env/$SteamAppId.env"
-    set +a
-fi
-# Tell the gamemode profile hook which profile this game wants (see gamemode-profile).
-HINT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gamemode-profile.hint
-if [ -n "${GAME_PROFILE:-}" ]; then
-    printf '%s %s\n' "$GAME_PROFILE" "${GAME_BALANCED_EPP:-}" > "$HINT"
+# Steam launch options: gamemode-external %command%
+#
+# 1. Settings: ~/.config/game-env/default.env, then ~/.config/game-env/<SteamAppId>.env
+#    (KEY=value lines; the game's file overrides the defaults).
+# 2. Frame target: GAME_FPS_TARGET_AC / _BATTERY by the power source at launch;
+#    with GAME_FRAME_LIMIT=1, Proton's DXVK/VKD3D limiters enforce it.
+# 3. Power: hands game-governor (system service, started by game-governor@<uid>.path)
+#    its targets, or with GAME_GOVERNOR=fixed asks the gamemode hook for GAME_PROFILE.
+# 4. GameMode: registers the game over D-Bus instead of gamemoderun, whose
+#    LD_PRELOAD trips Easy Anti-Cheat (Elden Ring crashed on launch with it).
+RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+GOV=$RUN/game-governor.env
+HINT=$RUN/gamemode-profile.hint
+
+for f in "$HOME/.config/game-env/default.env" "$HOME/.config/game-env/${SteamAppId:-none}.env"; do
+    if [ -r "$f" ]; then
+        set -a
+        . "$f"
+        set +a
+    fi
+done
+
+if [ "$(cat /sys/class/power_supply/ACAD/online 2>/dev/null)" = 0 ]; then
+    target=${GAME_FPS_TARGET_BATTERY:-60}
 else
-    rm -f "$HINT"
+    target=${GAME_FPS_TARGET_AC:-120}
+fi
+if [ "${GAME_FRAME_LIMIT:-1}" = 1 ]; then
+    export DXVK_FRAME_RATE="${DXVK_FRAME_RATE:-$target}" VKD3D_FRAME_RATE="${VKD3D_FRAME_RATE:-$target}"
+fi
+
+if [ "${GAME_GOVERNOR:-auto}" = auto ]; then
+    # Efficient start: Balanced fans, CPU at balance_performance (asusd EPP 2).
+    printf 'Balanced 2\n' > "$HINT"
+    printf 'APPID=%s\nTARGET_AC=%s\nTARGET_BATTERY=%s\n' \
+        "${SteamAppId:-0}" "${GAME_FPS_TARGET_AC:-120}" "${GAME_FPS_TARGET_BATTERY:-60}" > "$GOV"
+    [ -n "${GAME_CPU_MAX_MHZ:-}" ] && printf 'CPU_MAX_MHZ=%s\n' "$GAME_CPU_MAX_MHZ" >> "$GOV"
+else
+    printf '%s %s\n' "${GAME_PROFILE:-Performance}" "${GAME_BALANCED_EPP:-}" > "$HINT"
+    rm -f "$GOV"
 fi
 
 "$@" &
@@ -28,8 +49,17 @@ gdbus call --session \
   --method com.feralinteractive.GameMode.RegisterGame "$pid" >/dev/null 2>&1
 wait "$pid"
 status=$?
+
+# Stop the governor before GameMode's end hook restores the normal profile.
+rm -f "$GOV"
+i=0
+while [ -e "$RUN/game-governor.status" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
 gdbus call --session \
   --dest com.feralinteractive.GameMode \
   --object-path /com/feralinteractive/GameMode \
   --method com.feralinteractive.GameMode.UnregisterGame "$pid" >/dev/null 2>&1
+rm -f "$HINT"
 exit "$status"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Start the game governor when a game launches (user %i)
+
+[Path]
+PathExists=/run/user/%i/game-governor.env
+Unit=game-governor@%i.service
+
+[Install]
+WantedBy=multi-user.target

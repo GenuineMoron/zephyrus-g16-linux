@@ -1,0 +1,312 @@
+#!/usr/bin/python3 -I
+"""game-governor: keep a game at its frame target with as little power as it needs.
+
+Started by game-governor@<uid>.path when gamemode-external writes
+/run/user/<uid>/game-governor.env (APPID, TARGET_AC, TARGET_BATTERY); exits when
+that file is removed, which gamemode-external does as the game ends, before
+GameMode's end hook restores the normal profile.
+
+Two states:
+  efficient  Balanced profile (quieter fans); the gamemode start hook has set
+             Balanced's CPU EPP to balance_performance for the session.
+  boost      Performance profile (more GPU power, more fan).
+
+Rules, all measured on the game's own frame rate (presents per second, counted
+with a bpftrace uprobe on Proton's winevulkan vkQueuePresentKHR thunk):
+  - efficient -> boost when the game misses its target for 10 s (on AC only).
+    Boost must prove itself: if after 30 s the frame rate did not improve by
+    5 % (or reach the target), go back and treat the frame rate it had as the
+    game's own cap for 5 minutes (then 10, 20, ... if it happens again).
+  - boost -> efficient after 3 minutes at the target with the GPU at most 75 %
+    busy. If the target is then missed within 30 s, back to boost and wait
+    twice as long before trying again.
+  - No frame signal (native game, or the probe failed): Performance for the
+    session. Never throttle without measuring.
+  - Optional CPU_MAX_MHZ caps the CPU's top boost while efficient (lifted in
+    boost, always restored at exit). Off unless a game's settings ask for it.
+Every decision is logged (journalctl -u 'game-governor@*').
+"""
+import glob
+import os
+import pwd
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+
+UID = int(sys.argv[1])
+HOME = pwd.getpwuid(UID).pw_dir
+RUN = f"/run/user/{UID}"
+CFG = f"{RUN}/game-governor.env"
+STATUS = f"{RUN}/game-governor.status"
+GPU = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
+PROFILES = {"Balanced": 0, "Performance": 1}
+
+ESCALATE_AFTER = 10      # s below target in efficient
+ESCALATE_BELOW = 0.93    # fraction of target
+VALIDATE = 30            # s to judge a switch
+GAIN_NEEDED = 1.05       # boost must raise fps by 5 % (or reach the target)
+LEARNED_CAP_HOLD = 300   # s before retrying boost after it did not help
+DEESCALATE_AFTER = 180   # s at target with GPU headroom in boost
+DEESCALATE_GPU = 75      # % GPU busy at most to try efficient
+MIN_DWELL = 30           # s between switches
+ACTIVE_FPS = 10          # below this: menus, loading, paused
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read_cfg():
+    try:
+        text = open(CFG).read()
+    except OSError:
+        return None
+    cfg = {}
+    for line in text.splitlines():
+        m = re.fullmatch(r"(APPID|TARGET_AC|TARGET_BATTERY|CPU_MAX_MHZ)=(\d{1,7})", line.strip())
+        if m:
+            cfg[m.group(1)] = int(m.group(2))
+    return cfg
+
+
+def on_ac():
+    for d in glob.glob("/sys/class/power_supply/*"):
+        try:
+            if open(f"{d}/type").read().strip() == "Mains":
+                return open(f"{d}/online").read().strip() == "1"
+        except OSError:
+            pass
+    return True
+
+
+def current_profile():
+    try:
+        return open("/sys/firmware/acpi/platform_profile").read().strip()
+    except OSError:
+        return "?"
+
+
+def set_profile(name):
+    subprocess.run(["busctl", "--system", "set-property", "xyz.ljones.Asusd", "/xyz/ljones",
+                    "xyz.ljones.Platform", "PlatformProfile", "u", str(PROFILES[name])],
+                   capture_output=True, timeout=5)
+
+
+def cpu_cap(mhz):
+    """Cap every CPU's top frequency (efficient state only); None restores the hardware maximum."""
+    for d in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq"):
+        try:
+            hw = int(open(f"{d}/cpuinfo_max_freq").read())
+            khz = hw if mhz is None else max(int(open(f"{d}/cpuinfo_min_freq").read()), min(hw, mhz * 1000))
+            with open(f"{d}/scaling_max_freq", "w") as f:
+                f.write(str(khz))
+        except (OSError, ValueError):
+            pass
+
+
+def gpu_busy():
+    """GPU utilisation in %, or None. Only asks the driver while the GPU is awake."""
+    try:
+        if open(GPU).read().strip() != "active":
+            return None
+        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return int(out.split()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def probe_libs():
+    pats = ["/usr/share/steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so",
+            f"{HOME}/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so",
+            f"{HOME}/.local/share/Steam/steamapps/common/Proton*/files/lib/wine/x86_64-unix/winevulkan.so"]
+    probes = []
+    for lib in sorted({p for pat in pats for p in glob.glob(pat)}):
+        syms = subprocess.run(["nm", "--defined-only", lib], capture_output=True, text=True).stdout
+        for sym in ("thunk64_vkQueuePresentKHR", "thunk32_vkQueuePresentKHR"):
+            if re.search(rf" {sym}$", syms, re.M):
+                probes.append(f'uprobe:"{lib}":{sym}')
+    return probes
+
+
+def start_probe():
+    probes = probe_libs()
+    if not probes:
+        return None
+    prog = ", ".join(probes) + " { @n = @n + 1; } interval:s:1 { printf(\"%d\\n\", @n); @n = 0; }"
+    return subprocess.Popen(["bpftrace", "-B", "line", "-q", "-e", prog],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+
+class Governor:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.state = "efficient"
+        self.since = time.monotonic()
+        self.fps = []            # per-second presents, newest last
+        self.gpu = []            # GPU busy samples
+        self.pending = None      # ("escalate", fps_before) or ("deescalate", None)
+        self.learned_cap = None  # (fps, until)
+        self.cap_hold = LEARNED_CAP_HOLD
+        self.boost_hold = DEESCALATE_AFTER
+        self.seconds = {"efficient": 0, "boost": 0}
+        self.frames = 0
+
+    def target(self):
+        t = self.cfg.get("TARGET_AC" if on_ac() else "TARGET_BATTERY", 60)
+        if self.learned_cap and time.monotonic() < self.learned_cap[1]:
+            t = min(t, self.learned_cap[0])
+        return t
+
+    def avg(self, seconds):
+        s = self.fps[-seconds:]
+        return sum(s) / len(s) if s else 0.0
+
+    def switch(self, state, why):
+        self.state = state
+        self.since = time.monotonic()
+        set_profile("Performance" if state == "boost" else "Balanced")
+        if self.cfg.get("CPU_MAX_MHZ"):
+            cpu_cap(None if state == "boost" else self.cfg["CPU_MAX_MHZ"])
+        log(f"{state}: {why}")
+
+    def tick(self, fps, gpu):
+        now = time.monotonic()
+        self.fps.append(fps)
+        self.fps = self.fps[-600:]
+        if gpu is not None:
+            self.gpu.append(gpu)
+            self.gpu = self.gpu[-300:]
+        self.seconds[self.state] += 1
+        self.frames += fps
+        target = self.target()
+        dwell = now - self.since
+
+        if not on_ac():
+            if self.state == "boost":
+                self.pending = None
+                self.switch("efficient", "on battery")
+            elif current_profile() != "balanced":
+                set_profile("Balanced")
+            return
+
+        if self.pending and dwell >= VALIDATE:
+            kind, before = self.pending
+            self.pending = None
+            after = self.avg(20)
+            if kind == "escalate":
+                if after >= before * GAIN_NEEDED or after >= target * 0.97:
+                    log(f"boost kept: {before:.0f} -> {after:.0f} fps (target {target})")
+                else:
+                    self.learned_cap = (max(ACTIVE_FPS, round(before * 1.03)), now + self.cap_hold)
+                    self.switch("efficient", f"boost did not help ({before:.0f} -> {after:.0f} fps); "
+                                f"treating ~{before:.0f} fps as the game's cap for {self.cap_hold // 60} min")
+                    self.cap_hold *= 2
+            else:
+                if after < target * 0.95:
+                    self.boost_hold *= 2
+                    self.switch("boost", f"efficient missed the target ({after:.0f} < {target} fps); "
+                                f"next try in {self.boost_hold // 60} min")
+                else:
+                    self.boost_hold = DEESCALATE_AFTER
+                    log(f"efficient kept: {after:.0f} fps at target {target}")
+            return
+        if self.pending or dwell < MIN_DWELL:
+            return
+
+        recent = self.fps[-ESCALATE_AFTER:]
+        if self.state == "efficient":
+            if (len(recent) == ESCALATE_AFTER and all(ACTIVE_FPS <= f < target * ESCALATE_BELOW for f in recent)):
+                before = self.avg(ESCALATE_AFTER)
+                self.pending = ("escalate", before)
+                self.switch("boost", f"{before:.0f} fps below target {target} for {ESCALATE_AFTER} s; trying Performance")
+        else:
+            window = self.fps[-self.boost_hold:]
+            gpu = self.gpu[-self.boost_hold // 2:]
+            if (dwell >= self.boost_hold and len(window) >= self.boost_hold and min(window) >= ACTIVE_FPS
+                    and sum(window) / len(window) >= target * 0.98 and gpu and max(gpu) <= DEESCALATE_GPU):
+                self.pending = ("deescalate", None)
+                self.switch("efficient", f"{self.boost_hold // 60} min at target {target} with the GPU "
+                            f"at most {max(gpu)} % busy; trying Balanced")
+
+
+def write_status(text):
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text + "\n")
+    os.chown(tmp, UID, -1)
+    os.replace(tmp, STATUS)
+
+
+def main():
+    cfg = read_cfg()
+    if cfg is None:
+        return
+    probe = start_probe()
+    gov = Governor(cfg)
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    log(f"start: app {cfg.get('APPID')}, target {cfg.get('TARGET_AC')} fps on AC / "
+        f"{cfg.get('TARGET_BATTERY')} on battery, probe {'on' if probe else 'unavailable'}")
+    fallback = probe is None
+    if cfg.get("CPU_MAX_MHZ") and not fallback:
+        cpu_cap(cfg["CPU_MAX_MHZ"])
+        log(f"CPU capped at {cfg['CPU_MAX_MHZ']} MHz while efficient")
+    if fallback:
+        set_profile("Performance")
+        log("no frame signal: Performance for this session (never throttle blind)")
+    started = time.monotonic()
+    seen_frames = False
+    tick = 0
+    try:
+        while not stop and os.path.exists(CFG):
+            fps = None
+            if probe:
+                r, _, _ = select.select([probe.stdout], [], [], 1.5)
+                if r:
+                    line = probe.stdout.readline()
+                    if not line:
+                        probe = None
+                        fallback = True
+                        set_profile("Performance")
+                        log("frame probe stopped: Performance for the rest of the session")
+                        continue
+                    fps = int(line.strip() or 0)
+            else:
+                time.sleep(1)
+            if fallback or fps is None:
+                write_status("state=performance (no frame signal)")
+                continue
+            if fps:
+                seen_frames = True
+            elif not seen_frames and time.monotonic() - started > 120:
+                fallback = True
+                set_profile("Performance")
+                log("no frames seen in 2 min (not a Proton Vulkan game?): Performance for this session")
+                continue
+            tick += 1
+            gpu = gpu_busy() if tick % 2 == 0 else (gov.gpu[-1] if gov.gpu else None)
+            if seen_frames:
+                gov.tick(fps, gpu)
+            write_status(f"state={gov.state} fps={fps} target={gov.target()} gpu={gpu} ac={int(on_ac())}")
+    finally:
+        if probe:
+            probe.terminate()
+        if cfg.get("CPU_MAX_MHZ"):
+            cpu_cap(None)
+        total = gov.seconds["efficient"] + gov.seconds["boost"]
+        if total:
+            log(f"end: {total // 60} min played, avg {gov.frames / total:.0f} fps, "
+                f"Performance {100 * gov.seconds['boost'] // total} % of the time")
+        try:
+            os.remove(STATUS)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -51,3 +51,4 @@ The first notes come from two waves of deep reading of this laptop on 2026-11-14
 | [41](41-guides-g-helper-keys-2026-11-16.md) | Similar guides and G-Helper reviewed; white keyboard confirmed by its capability report; G-Helper-style Fn-lock (hwdb); GU605MI sleep-reset hook; SearXNG; cifs-utils regression |
 | [42](42-audit-2026-11-16.md) | Audit: health-check false alarm and dead mount timer fixed, `g16-doctor` in the repo, ROG Control 1.3.0 (maintainer review + 11 more fixes), idle wake-ups by source (Noctalia lock-keys 200 ms poll) |
 | [43](43-elden-ring-umbriel.md) | Elden Ring under Umbriel: Xwayland white screen and Wayland swapchain crash, both from VK_EXT_present_timing (NVIDIA 620 + PRIME); per-game env via gamemode-external |
+| [44](44-game-power-governor.md) | Game power: frame target per game (divisors of 240), efficient Balanced + balance_performance start, a governor that boosts to Performance only while it measurably helps; game-capture tool |

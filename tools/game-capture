@@ -1,0 +1,112 @@
+#!/usr/bin/python3 -I
+"""game-capture: measure a running Proton game for N seconds (default 120).
+
+    sudo game-capture [seconds]
+
+Counts every frame the game presents (bpftrace uprobe on Proton's winevulkan
+vkQueuePresentKHR thunk, the same signal game-governor uses) and samples the
+NVIDIA GPU, CPU package power (RAPL), CPU temperature and the ASUS fans.
+Prints average fps, 1 % / 0.1 % lows, frame-time percentiles and the share of
+slow frames, then fps per 10-second window so dips can be placed in time.
+Play the same stretch for each setting you compare.
+"""
+import glob
+import re
+import subprocess
+import sys
+import threading
+import time
+
+DUR = int(sys.argv[1]) if len(sys.argv) > 1 else 120
+HOMES = glob.glob("/home/*")
+
+
+def libs():
+    pats = ["/usr/share/steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so"]
+    for h in HOMES:
+        pats += [f"{h}/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/x86_64-unix/winevulkan.so",
+                 f"{h}/.local/share/Steam/steamapps/common/Proton*/files/lib/wine/x86_64-unix/winevulkan.so"]
+    probes = []
+    for lib in sorted({p for pat in pats for p in glob.glob(pat)}):
+        syms = subprocess.run(["nm", "--defined-only", lib], capture_output=True, text=True).stdout
+        for sym in ("thunk64_vkQueuePresentKHR", "thunk32_vkQueuePresentKHR"):
+            if re.search(rf" {sym}$", syms, re.M):
+                probes.append(f'uprobe:"{lib}":{sym}')
+    return probes
+
+
+def read(path, default=None):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return default
+
+
+def main():
+    probes = libs()
+    if not probes:
+        sys.exit("no Proton winevulkan.so with a present thunk found")
+    prog = ", ".join(probes) + (" { if (@last[pid]) { printf(\"%d\\n\", (nsecs - @last[pid]) / 1000); }"
+                                " @last[pid] = nsecs; }")
+    bp = subprocess.Popen(["timeout", str(DUR), "bpftrace", "-B", "line", "-q", "-e", prog],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    frames = []
+    reader = threading.Thread(target=lambda: frames.extend(
+        int(l) for l in bp.stdout if l.strip().isdigit()), daemon=True)
+    reader.start()
+
+    gpu, temps, fans = [], [], []
+    e0 = int(read("/sys/class/powercap/intel-rapl:0/energy_uj", "0")); t0 = time.time()
+    end = t0 + DUR
+    while time.time() < end:
+        time.sleep(2)
+        if read("/sys/bus/pci/devices/0000:01:00.0/power/runtime_status") == "active":
+            out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,power.draw,enforced.power.limit,"
+                                  "clocks.gr,temperature.gpu", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True).stdout.split(", ")
+            try:
+                gpu.append([float(x) for x in out])
+            except ValueError:
+                pass
+        for h in glob.glob("/sys/class/hwmon/hwmon*"):
+            name = read(f"{h}/name")
+            if name == "coretemp":
+                temps.append(int(read(f"{h}/temp1_input", "0")) // 1000)
+            elif name == "asus":
+                fans.append([int(read(f"{h}/fan{i}_input", "0")) for i in (1, 2, 3)])
+    e1 = int(read("/sys/class/powercap/intel-rapl:0/energy_uj", "0")); t1 = time.time()
+    bp.wait()
+    reader.join(timeout=2)
+
+    print(f"profile {read('/sys/firmware/acpi/platform_profile')}, EPP "
+          f"{read('/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference')}, "
+          f"{'AC' if read('/sys/class/power_supply/ACAD/online') == '1' else 'battery'}")
+    if e1 > e0:
+        print(f"CPU package {(e1 - e0) / 1e6 / (t1 - t0):.1f} W, temp avg {sum(temps) / max(1, len(temps)):.0f} C "
+              f"(max {max(temps, default=0)})")
+    if gpu:
+        avg = [sum(c) / len(c) for c in zip(*gpu)]
+        print(f"GPU {avg[0]:.0f} % busy, {avg[1]:.1f} W (limit {avg[2]:.0f} W), {avg[3]:.0f} MHz, "
+              f"{avg[4]:.0f} C (max {max(g[4] for g in gpu):.0f})")
+    if fans:
+        f = [sum(c) / len(c) for c in zip(*fans)]
+        print(f"fans cpu {f[0]:.0f} / gpu {f[1]:.0f} / mid {f[2]:.0f} rpm")
+    v = [x for x in frames if 0 < x < 1_000_000]
+    if len(v) < 50:
+        print(f"frames: only {len(v)} captured (is a Proton Vulkan game running and moving?)")
+        return
+    windows, acc, cnt = [], 0, 0
+    for x in v:
+        acc += x; cnt += 1
+        if acc >= 10_000_000:
+            windows.append(cnt / (acc / 1e6)); acc = cnt = 0
+    s = sorted(v); n = len(s)
+    lows = lambda q: 1e6 / (sum(s[int(q * n):]) / len(s[int(q * n):]))
+    print(f"frames {n}: avg {n / (sum(s) / 1e6):.1f} fps, 1 % low {lows(0.99):.1f}, 0.1 % low {lows(0.999):.1f}, "
+          f"frame time p50 {s[n // 2] / 1000:.2f} ms, p99 {s[int(0.99 * n)] / 1000:.2f} ms, max {s[-1] / 1000:.1f} ms, "
+          f"over 20 ms {100 * sum(1 for x in s if x > 20000) / n:.1f} %")
+    print("fps per 10 s:", " ".join(f"{w:.0f}" for w in windows))
+
+
+if __name__ == "__main__":
+    main()
