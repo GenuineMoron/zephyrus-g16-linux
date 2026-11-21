@@ -51,6 +51,10 @@ How it's applied:
 - **Hand-off:** [gamemode-external](../../configs/home/.local/bin/gamemode-external) leaves a hint, and [gamemode-profile](../../configs/home/.local/bin/gamemode-profile) applies it at game start through asusd's `ProfileBalancedEpp`. It restores the original value and the AC/battery profile at the end.
 - **Other games** still get Performance.
 
+## Xid 31 at game exit (2026-11-18)
+
+When Elden Ring exited on 18 Nov at 13:03:05, the driver logged `Xid 31` (MMU fault, engine CE2_PBDMA0, FAULT_PDE ACCESS) and then `Xid 154: GPU recovery action changed from None to OS Reboot`. `nvidia-smi -q` still reported `GPU Recovery Action: Reboot` three days later. The GPU kept working, but NVIDIA's guidance is to reboot. g16-doctor flags any Xid in the boot's log. If it happens again at exit, report it with an nvidia-bug-report.
+
 ## Open
 
 - Report upstream (VKD3D-Proton and/or NVIDIA) with the log once the gameplay test confirms stability.
